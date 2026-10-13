@@ -89,6 +89,13 @@ ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通�
 ROUND_GAP_CREATE = 75            # 无实例时轮间隔
 ROUND_GAP_RESIZE = 150           # 有实例时轮间隔
 ROUND_GAP_IDLE = 420             # 顶配巡检间隔
+
+# 接力模式：单棒最长运行秒数（0=不限）。GitHub 单个 job 上限 6 小时，
+# workflow 传 19500（约 5.4 小时）跑满后优雅退场，再由 workflow 触发下一棒，
+# 从而绕开 GitHub 那个不投递的 cron 调度器。
+MAX_SECONDS = 0
+START_TS = time.time()
+REPORT_SENT_DATE = ""            # 长棒模式下防止日报重复发
 POLL_INTERVAL = 15
 WAIT_RUNNING_TIMEOUT = 420       # Actions 里单 run 有时长预算，等 RUNNING 上限 7 分钟
 STATE_WAIT_TIMEOUT = 240
@@ -546,6 +553,9 @@ def main():
     if "--rounds" in sys.argv:
         global ROUNDS
         ROUNDS = int(sys.argv[sys.argv.index("--rounds") + 1])
+    if "--max-seconds" in sys.argv:
+        global MAX_SECONDS
+        MAX_SECONDS = int(sys.argv[sys.argv.index("--max-seconds") + 1])
 
     print("=" * 60)
     print("甲骨文抢机 Actions 版启动 | 北京时间 {} | rounds={} dry={} status={}".format(
@@ -591,6 +601,24 @@ def main():
                      "```\n{}\n```".format(str(fail.get("message"))[:800]))
                 break
 
+            # 接力模式：跑满本棒时限就优雅收尾，剩余时间交给下一棒
+            if MAX_SECONDS and (time.time() - START_TS) >= MAX_SECONDS:
+                print("[RELAY] 本棒已跑 {}s（上限 {}s），优雅退出，交给下一棒".format(
+                    int(time.time() - START_TS), MAX_SECONDS))
+                break
+
+            # 日报：北京时间 9 点。长棒模式下必须放在循环内判断，否则整棒跨过 9 点会漏发
+            if not DRY_RUN:
+                _n = datetime.datetime.now(TZ_BJ)
+                if _n.hour == REPORT_HOUR_BJ and REPORT_SENT_DATE != _n.strftime("%Y-%m-%d"):
+                    globals()["REPORT_SENT_DATE"] = _n.strftime("%Y-%m-%d")
+                    c3 = get_current_tier(arms)
+                    push("甲骨文抢机日报：{}".format(TIERS[c3[0]]["label"] if c3 else "尚未抢到"),
+                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}".format(
+                             now_bj(), TIERS[c3[0]]["label"] if c3 else "无（仍在抢）",
+                             quota_text(arms), run_summary(), daily_summary(),
+                             build_instance_table(compute)))
+
             if r < ROUNDS:
                 c = get_current_tier(arms)
                 gap = ROUND_GAP_CREATE if c is None else (
@@ -601,8 +629,9 @@ def main():
 
         save_state(state)
 
-        # 日报：北京时间 9 点所在 run
-        if datetime.datetime.now(TZ_BJ).hour == REPORT_HOUR_BJ and not DRY_RUN:
+        # 日报：北京时间 9 点所在 run（循环里已发过则跳过，避免重复推送）
+        _n2 = datetime.datetime.now(TZ_BJ)
+        if _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
             push("甲骨文抢机日报：{}".format(TIERS[cur2[0]]["label"] if cur2 else "尚未抢到"),
                  "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}".format(
