@@ -1,13 +1,16 @@
 name: Oracle Grab
 
 # ======================= 运行方式：自我接力长棒（不依赖 GitHub cron） =======================
-# 为什么不用 schedule：
-#   实测本仓库的 schedule 事件**完全不投递** —— 私有期间 UTC 06:07/08:07/09:07/09:37/09:55/10:00
+# 为什么不用 schedule 作为主方案：
+#   实测**本仓库**的 schedule 事件完全不投递 —— 私有期间 UTC 06:07/08:07/09:07/09:37/09:55/10:00
 #   等十几个触发点全部落空；转 Public 之后再用 "*/5"（每 5 分钟）测试，
 #   10:45 / 10:50 / 10:55 / 11:00 依然一次没跑（API 查 event=schedule → total_count=0），
 #   而 workflow_dispatch 次次成功。GitHub 官方状态页显示 Actions 一切正常。
 #   已排除：cron 语法（逗号/多条/星号都试过）、default_branch、Actions 权限、
 #           token scope、账号状态、是否 fork、有无阻塞中的 run。
+#   ⚠ 注：不能推广成"私有仓库 schedule 都不投递" —— 另一个账号下的私有仓库
+#     dishaoying/oracle-grab 有 2 次成功的 schedule 运行。只能说本仓库/本账号的
+#     定时投递有问题，根因未明。
 #
 # 现在怎么做：
 #   单次 run 连续抢 5.4 小时（GitHub 单个 job 上限 6 小时，留 30 分钟缓冲），
@@ -15,11 +18,15 @@ name: Oracle Grab
 #   只需手动启动一次（relay=true），之后全天不间断；电脑关机、卸载 WorkBuddy 都不受影响。
 #   这比"每 30 分钟跑 4 分钟"强得多：中间没有空档，是真·24 小时连续蹲守。
 #
-# schedule 保留作为备份：哪天 GitHub 修好了，它也能拉起（但不会接力，只跑默认轮数）。
+# 为什么仓库是 Public（与定时无关，是分钟额度决定的）：
+#   Free 账号的私有仓库每月只有 2000 分钟 Actions ≈ 33 小时 ≈ 每天 1.1 小时；
+#   而接力长棒是 24 小时不停，公开仓库才无分钟上限。
+#   代价是代码与运行日志可见 —— 所以脚本里不许出现任何硬编码凭据：
+#   OCI 私钥 / Server酱 Key / SSH 公钥 / 接力用 PAT 全部存在 Secrets（加密存储），
+#   compartment 也改为由 OCI_CONFIG_JSON 里的 tenancy 推断。
 #
-# 安全：OCI 私钥 / Server酱 Key / SSH 公钥 / 接力用 PAT 全部存在 Secrets（加密存储）；
-#       脚本内没有任何硬编码凭据，compartment 由 OCI_CONFIG_JSON 里的 tenancy 推断。
-# ⚠ 本仓库是 Public —— Free 账号的私有仓库 schedule 不投递，且公开仓库 Actions 分钟无限。
+# 链路断了怎么发现：每天北京时间 09:00 会发微信日报。哪天没收到，就是链断了，
+#   去 Actions 页面手动 Run workflow（relay 选 true）即可重新接上。
 # ======================================================================================
 on:
   schedule:
