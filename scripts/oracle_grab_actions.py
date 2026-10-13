@@ -86,7 +86,7 @@ TIERS = [
 ARM_SHAPE = "VM.Standard.A1.Flex"
 
 ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通过输入覆盖）
-ROUND_GAP_CREATE = 75            # 无实例时轮间隔
+ROUND_GAP_CREATE = 45            # 无实例时轮间隔（老板定：75s → 45s，抢机更勤；再往下会频繁撞 OCI 429 限流）
 ROUND_GAP_RESIZE = 150           # 有实例时轮间隔
 ROUND_GAP_IDLE = 420             # 顶配巡检间隔
 
