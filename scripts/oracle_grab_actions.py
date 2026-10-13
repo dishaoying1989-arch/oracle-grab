@@ -57,9 +57,21 @@ OCI_CONFIG_JSON = os.environ.get("OCI_CONFIG_JSON", "")
 OCI_PRIVATE_KEY = os.environ.get("OCI_PRIVATE_KEY", "")
 SSH_PUB_KEY = os.environ.get("SSH_PUB_KEY", "").strip()
 
-COMPARTMENT_ID = "ocid1.tenancy.oc1..aaaaaaaan372luvnj6hiojn3kf3oihhpa75q2j6ugwsmvupictoy3hfo56rq"
+def _tenancy_from_cfg():
+    """从 OCI_CONFIG_JSON 里取 tenancy（根 compartment）—— 避免把租户 OCID 硬编码进公开仓库。"""
+    try:
+        return (json.loads(OCI_CONFIG_JSON) or {}).get("tenancy", "").strip()
+    except Exception:
+        return ""
+
+
+# 优先用 Secret OCI_COMPARTMENT_ID；否则用配置文件里的 tenancy（根 compartment 即租户）
+COMPARTMENT_ID = os.environ.get("OCI_COMPARTMENT_ID", "").strip() or _tenancy_from_cfg()
 AVAILABILITY_DOMAIN = "QKbr:AP-OSAKA-1-AD-1"
-SUBNET_ID = "ocid1.subnet.oc1.ap-osaka-1.aaaaaaaarlrg6qcpgpm4icz3hb3kix5aix7s74f5ej5vgqz4pop5h5un47kq"
+# 子网 OCID 不是凭据（任何操作仍需 API 私钥签名），保留回退值以便开箱即用；
+# 可用 Secret OCI_SUBNET_ID 覆盖。
+SUBNET_ID = os.environ.get("OCI_SUBNET_ID", "").strip() or \
+    "ocid1.subnet.oc1.ap-osaka-1.aaaaaaaarlrg6qcpgpm4icz3hb3kix5aix7s74f5ej5vgqz4pop5h5un47kq"
 ARM_IMAGE_ID = "ocid1.image.oc1.ap-osaka-1.aaaaaaaafjymvqo2bqj5uur45dfvhch6sp72yedb7xfaenkbvufx5zisnmya"  # 回退值
 BOOT_VOLUME_GB = 50
 
@@ -244,6 +256,8 @@ def init_clients():
     import oci
     if not OCI_CONFIG_JSON or not OCI_PRIVATE_KEY:
         raise RuntimeError("缺少 Secrets：OCI_CONFIG_JSON / OCI_PRIVATE_KEY 未配置")
+    if not COMPARTMENT_ID:
+        raise RuntimeError("无法确定 compartment：OCI_CONFIG_JSON 缺少 tenancy 字段，请补上或新增 Secret OCI_COMPARTMENT_ID")
     key_file = os.path.join(tempfile.gettempdir(), "oci_api_key.pem")
     with open(key_file, "w", encoding="utf-8") as f:
         f.write(OCI_PRIVATE_KEY.replace("\\n", "\n") if "\\n" in OCI_PRIVATE_KEY else OCI_PRIVATE_KEY)
@@ -266,7 +280,7 @@ def init_clients():
             identity.list_availability_domains, compartment_id=COMPARTMENT_ID).data]
         if names:
             AVAILABILITY_DOMAIN = names[0]
-            print("[AD] {}", AVAILABILITY_DOMAIN)
+            print("[AD]", AVAILABILITY_DOMAIN)
     except Exception as e:
         print("[AD] 探测失败，用回退值:", str(e)[:100])
     try:
