@@ -15,8 +15,6 @@ on:
     # 用两条独立 cron 条目，比 "7,37 * * * *" 逗号写法更稳。
     - cron: "7 * * * *"
     - cron: "37 * * * *"
-    # ⚠ 临时诊断（每 5 分钟）：验证公开仓库的 schedule 是否投递。确认后删除本条。
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       rounds:
