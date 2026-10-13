@@ -99,7 +99,7 @@ REPORT_SENT_DATE = ""            # 长棒模式下防止日报重复发
 POLL_INTERVAL = 15
 WAIT_RUNNING_TIMEOUT = 420       # Actions 里单 run 有时长预算，等 RUNNING 上限 7 分钟
 STATE_WAIT_TIMEOUT = 240
-REPORT_HOUR_BJ = 9               # 北京时间 9 点发日报
+REPORT_HOUR_BJ = 2               # 北京时间每天 02:00 发日报（老板定的体检推送时间点）
 STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")   # 跨 run 状态（cache 挂载点）
 
 ALIVE_STATES = ("RUNNING", "STOPPED", "STARTING", "STOPPING", "PROVISIONING")
@@ -251,11 +251,23 @@ def save_state(st):
         print("[STATE WRITE FAILED]", e)
 
 
+def baton_info():
+    """接力链健康信息：本棒 run 编号 / 已跑时长 / 距交棒剩余"""
+    rnum = os.environ.get("GITHUB_RUN_NUMBER", "-")
+    el = int(time.time() - START_TS)
+    txt = "本棒 run #{}，已跑 {}h{}m".format(rnum, el // 3600, (el % 3600) // 60)
+    if MAX_SECONDS:
+        left = max(0, int(MAX_SECONDS - el))
+        txt += "，{}h{}m 后交给下一棒".format(left // 3600, (left % 3600) // 60)
+    return txt
+
+
 def daily_summary():
     st = load_state()
-    return "今日累计（北京时间 {}）：已拉起 {} 轮 | 新建 {} 次 / 升配 {} 次 | 成功 {} | 容量不足 {}".format(
+    return ("今日累计（北京时间 {}）：已拉起 {} 轮 | 新建 {} 次 / 升配 {} 次 | 成功 {} | 容量不足 {}\n"
+            "接力链：{}").format(
         now_bj(), st.get("runs", 0), st.get("create_try", 0), st.get("resize_try", 0),
-        st.get("success", 0), st.get("capacity", 0))
+        st.get("success", 0), st.get("capacity", 0), baton_info())
 
 
 # ---------------- OCI 初始化 ----------------
@@ -607,7 +619,7 @@ def main():
                     int(time.time() - START_TS), MAX_SECONDS))
                 break
 
-            # 日报：北京时间 9 点。长棒模式下必须放在循环内判断，否则整棒跨过 9 点会漏发
+            # 日报：北京时间 02:00。长棒模式下必须放在循环内判断，否则整棒跨过 2 点会漏发
             if not DRY_RUN:
                 _n = datetime.datetime.now(TZ_BJ)
                 if _n.hour == REPORT_HOUR_BJ and REPORT_SENT_DATE != _n.strftime("%Y-%m-%d"):
@@ -629,7 +641,7 @@ def main():
 
         save_state(state)
 
-        # 日报：北京时间 9 点所在 run（循环里已发过则跳过，避免重复推送）
+        # 日报：北京时间 02:00 所在 run（循环里已发过则跳过，避免重复推送）
         _n2 = datetime.datetime.now(TZ_BJ)
         if _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
