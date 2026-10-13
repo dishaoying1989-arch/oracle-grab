@@ -1,32 +1,46 @@
 name: Oracle Grab
 
-# 全天持续抢机：每 30 分钟拉起一次（每小时的 07 分 / 37 分，避开整点调度高峰），
-# 每次 run 内做 3 轮尝试。
-# 2026-10-13 已转为 Public 仓库 —— 原因：GitHub Free 账号的「私有仓库」schedule 定时
-#   根本不会触发（未公开限制，社区已确认），只有 workflow_dispatch / push 能跑。
-#   实测：私有期间 UTC 06:07/08:07/09:07/09:37/09:55/10:00 等十几个触发点全部落空。
-#   转 Public 后：schedule 正常 + Actions 分钟无限，30 分钟一轮无任何额度压力。
-#   安全：OCI 私钥 / Server酱 Key / SSH 公钥都在 Secrets（加密），脚本内无硬编码凭据；
-#        compartment 由 OCI_CONFIG_JSON 的 tenancy 推断，也未硬编码租户 OCID。
-#   ⚠ 若要转回私有，必须先换成 Pro 账号或用外部 cron 打 workflow_dispatch，否则会停摆。
+# ======================= 运行方式：自我接力长棒（不依赖 GitHub cron） =======================
+# 为什么不用 schedule：
+#   实测本仓库的 schedule 事件**完全不投递** —— 私有期间 UTC 06:07/08:07/09:07/09:37/09:55/10:00
+#   等十几个触发点全部落空；转 Public 之后再用 "*/5"（每 5 分钟）测试，
+#   10:45 / 10:50 / 10:55 / 11:00 依然一次没跑（API 查 event=schedule → total_count=0），
+#   而 workflow_dispatch 次次成功。GitHub 官方状态页显示 Actions 一切正常。
+#   已排除：cron 语法（逗号/多条/星号都试过）、default_branch、Actions 权限、
+#           token scope、账号状态、是否 fork、有无阻塞中的 run。
+#
+# 现在怎么做：
+#   单次 run 连续抢 5.4 小时（GitHub 单个 job 上限 6 小时，留 30 分钟缓冲），
+#   跑满前调 GitHub API 启动下一棒 —— 形成接力链。
+#   只需手动启动一次（relay=true），之后全天不间断；电脑关机、卸载 WorkBuddy 都不受影响。
+#   这比"每 30 分钟跑 4 分钟"强得多：中间没有空档，是真·24 小时连续蹲守。
+#
+# schedule 保留作为备份：哪天 GitHub 修好了，它也能拉起（但不会接力，只跑默认轮数）。
+#
+# 安全：OCI 私钥 / Server酱 Key / SSH 公钥 / 接力用 PAT 全部存在 Secrets（加密存储）；
+#       脚本内没有任何硬编码凭据，compartment 由 OCI_CONFIG_JSON 里的 tenancy 推断。
+# ⚠ 本仓库是 Public —— Free 账号的私有仓库 schedule 不投递，且公开仓库 Actions 分钟无限。
+# ======================================================================================
 on:
   schedule:
-    # 每 30 分钟一次：每小时的第 7 分和第 37 分（避开整点调度高峰）。
-    # 用两条独立 cron 条目，比 "7,37 * * * *" 逗号写法更稳。
     - cron: "7 * * * *"
     - cron: "37 * * * *"
   workflow_dispatch:
     inputs:
       rounds:
-        description: "本次 run 的尝试轮数"
+        description: "非接力模式的尝试轮数"
         required: false
         default: "3"
+      relay:
+        description: "接力模式：跑满 5.4 小时后自动启动下一棒（true/false）"
+        required: false
+        default: "false"
       dry_run:
         description: "只查询不创建（true/false）"
         required: false
         default: "false"
 
-# 防止定时与手动触发并发抢机
+# 防止上一棒还没退场、下一棒就开抢（同一 Oracle 账号只应有一个抢机进程）
 concurrency:
   group: oracle-grab
   cancel-in-progress: false
@@ -34,7 +48,7 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 350 # 6 小时是 GitHub 硬上限，留 30 分钟缓冲
     steps:
       - uses: actions/checkout@v4
 
@@ -63,8 +77,10 @@ jobs:
           SSH_PUB_KEY: ${{ secrets.SSH_PUB_KEY }}
           GRAB_STATE_DIR: .grab_state
         run: |
+          echo "$(date +%s)" > /tmp/grab_start_ts
           python scripts/oracle_grab_actions.py \
-            --rounds "${{ github.event.inputs.rounds || '3' }}" \
+            --rounds "${{ github.event.inputs.relay == 'true' && '9999' || github.event.inputs.rounds || '3' }}" \
+            --max-seconds "${{ github.event.inputs.relay == 'true' && '19500' || '0' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
 
       # 失败也把日志抛出来，方便在 Actions 页面直接看
@@ -76,3 +92,22 @@ jobs:
           path: .grab_state/
           if-no-files-found: ignore
           retention-days: 3
+
+      # 接力：本棒快跑满时启动下一棒。用 PAT 而非 GITHUB_TOKEN
+      # （GITHUB_TOKEN 触发的事件不会再唤起新的 workflow，会断链）
+      - name: 接力下一棒
+        if: always() && github.event.inputs.relay == 'true'
+        run: |
+          st=$(cat /tmp/grab_start_ts 2>/dev/null || echo 0)
+          el=$(( $(date +%s) - st ))
+          echo "本棒运行 ${el}s"
+          if [ "$el" -lt 300 ]; then
+            echo "⚠ 本棒异常早退（不足 5 分钟），不接力，避免空转循环"
+            exit 0
+          fi
+          echo "=> 触发下一棒"
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oracle-grab.yml/dispatches \
+            -d '{"ref":"main","inputs":{"relay":"true"}}'
