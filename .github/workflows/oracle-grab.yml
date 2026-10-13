@@ -12,7 +12,9 @@ name: Oracle Grab
 #    额度恢复时间：GitHub 每月按账号注册日重置。
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    # 写成两条 cron（GitHub 官方推荐写法，比 "7,37" 逗号列表更可靠）
+    - cron: "7 * * * *"
+    - cron: "37 * * * *"
   workflow_dispatch:
     inputs:
       rounds:
