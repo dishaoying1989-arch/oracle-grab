@@ -99,11 +99,14 @@ REPORT_SENT_DATE = ""            # 长棒模式下防止日报重复发
 POLL_INTERVAL = 15
 WAIT_RUNNING_TIMEOUT = 420       # Actions 里单 run 有时长预算，等 RUNNING 上限 7 分钟
 STATE_WAIT_TIMEOUT = 240
-REPORT_HOUR_BJ = 2               # 北京时间每天 02:00 云端发日报（战报：档位/额度/今日累计）。
-                                 # 老板决定：电脑关机也要收到推送，所以云端这条必须开着
-                                 # —— 它跑在 GitHub 上，跟本机开不开机完全无关。
-                                 # 于是每天 02:00 来自云端、02:25 来自 WorkBuddy 自动化体检，共两条。
-                                 # 想变回一天一条：把这里改成 -1（只留自动化的体检报告）。
+REPORT_HOUR_BJ = 2               # 北京时间每天 **02:00** 云端发「战报 + 体检」合并日报（每天只此一条）。
+                                 # 老板决定：电脑关机也要收到推送 → 只有跑在 GitHub 上的这条能做到，
+                                 # 本机 WorkBuddy 的体检自动化改为**静默巡检**（只修问题，不发日常推送）。
+                                 # 原因是 Server酱 Turbo 免费额度每天仅 5 条：
+                                 #   固定占 1 条，剩 4 条留给"抢到机/升配成功/配置错误"等即时事件，
+                                 #   否则真抢到的那条可能被当日额度挤掉，反而收不到。
+                                 # 日报内容已包含链路体检（见 chain_health()），所以不需要第二条。
+                                 # 想彻底关掉日报：把这里改成 -1。
                                  # 抢到机 / 升配成功 / 配置错误这类**事件推送**不受此开关影响，永远即时推。
 STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")   # 跨 run 状态（cache 挂载点）
 
@@ -273,6 +276,69 @@ def daily_summary():
             "接力链：{}").format(
         now_bj(), st.get("runs", 0), st.get("create_try", 0), st.get("resize_try", 0),
         st.get("success", 0), st.get("capacity", 0), baton_info())
+
+
+def _gh_runs(per_page=20):
+    """只读查本仓库最近的 Actions run（公开仓库匿名可读；有 GH_PAT 时带鉴权提高限额）"""
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repo:
+        return None
+    import requests
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "oracle-grab-health"}
+    pat = os.environ.get("GH_PAT", "").strip()
+    if pat:
+        h["Authorization"] = "Bearer " + pat
+    r = requests.get("https://api.github.com/repos/{}/actions/runs?per_page={}".format(repo, per_page),
+                     headers=h, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError("GitHub API HTTP {}".format(r.status_code))
+    return (r.json() or {}).get("workflow_runs", []) or []
+
+
+def chain_health():
+    """接力链体检（只读，不创建任何资源）：24h 运行次数/失败数、有无空档、有无重复棒。
+    原来这部分由本机 WorkBuddy 自动化负责，现已合并进云端日报 —— 每天只发这一条微信。"""
+    if not os.environ.get("GITHUB_REPOSITORY"):
+        return "链路体检：非 Actions 环境，跳过"
+    try:
+        runs = _gh_runs(20)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def _t(x):
+            return datetime.datetime.strptime(x["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+
+        d24 = [x for x in runs if (now - _t(x)).total_seconds() <= 86400]
+        me = str(os.environ.get("GITHUB_RUN_NUMBER", ""))
+        dup = [x for x in runs if x.get("status") in ("in_progress", "queued")
+               and str(x.get("run_number")) != me]
+        fails = [x for x in d24 if x.get("conclusion") == "failure"]
+
+        gap_max, gap_at = 0.0, ""
+        ordered = sorted(d24, key=_t)
+        for a, b in zip(ordered, ordered[1:]):
+            g = (_t(b) - _t(a)).total_seconds()
+            if g > gap_max:
+                gap_max, gap_at = g, _t(b).astimezone(TZ_BJ).strftime("%d日 %H:%M")
+
+        lines = ["## 链路体检",
+                 "- 24h 内共运行 **{}** 次，失败 **{}** 次".format(len(d24), len(fails))]
+        if gap_max > 900:
+            lines.append("- ⚠ 24h 内最大空档 **{}h{}m**（{} 那次启动前），期间疑似断过链 → "
+                         "由体检自动化或人工重启接上".format(
+                             int(gap_max) // 3600, (int(gap_max) % 3600) // 60, gap_at))
+        else:
+            lines.append("- ✅ 接力连续，24h 内最大间隔仅 {} 分钟".format(int(gap_max) // 60))
+        if dup:
+            lines.append("- ⚠ 除本棒外还有 {} 个 run 在活动（{}），可能重复抢同一 Oracle 账号 → "
+                         "建议去 Actions 页面取消多余的".format(
+                             len(dup), "、".join("#" + str(x.get("run_number")) for x in dup[:3])))
+        lines.append("- 最近运行：" + "、".join(
+            "#{}({})".format(x.get("run_number"), x.get("conclusion") or x.get("status"))
+            for x in runs[:5]))
+        return "\n".join(lines)
+    except Exception as e:
+        return "## 链路体检\n- 体检失败（不影响抢机）：{}".format(str(e)[:120])
 
 
 # ---------------- OCI 初始化 ----------------
@@ -631,10 +697,10 @@ def main():
                     globals()["REPORT_SENT_DATE"] = _n.strftime("%Y-%m-%d")
                     c3 = get_current_tier(arms)
                     push("甲骨文抢机日报：{}".format(TIERS[c3[0]]["label"] if c3 else "尚未抢到"),
-                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}".format(
+                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}".format(
                              now_bj(), TIERS[c3[0]]["label"] if c3 else "无（仍在抢）",
                              quota_text(arms), run_summary(), daily_summary(),
-                             build_instance_table(compute)))
+                             build_instance_table(compute), chain_health()))
 
             if r < ROUNDS:
                 c = get_current_tier(arms)
@@ -651,10 +717,10 @@ def main():
         if REPORT_HOUR_BJ >= 0 and _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
             push("甲骨文抢机日报：{}".format(TIERS[cur2[0]]["label"] if cur2 else "尚未抢到"),
-                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}".format(
+                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}".format(
                      now_bj(), TIERS[cur2[0]]["label"] if cur2 else "无（仍在抢）",
                      quota_text(arms), run_summary(), daily_summary(),
-                     build_instance_table(compute)))
+                     build_instance_table(compute), chain_health()))
 
         print("\n===== 汇总 =====")
         print(run_summary())
