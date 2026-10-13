@@ -99,9 +99,12 @@ REPORT_SENT_DATE = ""            # 长棒模式下防止日报重复发
 POLL_INTERVAL = 15
 WAIT_RUNNING_TIMEOUT = 420       # Actions 里单 run 有时长预算，等 RUNNING 上限 7 分钟
 STATE_WAIT_TIMEOUT = 240
-REPORT_HOUR_BJ = -1              # 每日体检推送由 WorkBuddy 自动化（北京时间每天 02:00）负责，
-                                 # 云端这里关掉，避免一天收到两条微信。改回 0~23 即可恢复云端日报。
-                                 # 注意：抢到机 / 升配成功 / 配置错误这类**事件推送**不受此开关影响，永远会推。
+REPORT_HOUR_BJ = 2               # 北京时间每天 02:00 云端发日报（战报：档位/额度/今日累计）。
+                                 # 老板决定：电脑关机也要收到推送，所以云端这条必须开着
+                                 # —— 它跑在 GitHub 上，跟本机开不开机完全无关。
+                                 # 于是每天 02:00 来自云端、02:25 来自 WorkBuddy 自动化体检，共两条。
+                                 # 想变回一天一条：把这里改成 -1（只留自动化的体检报告）。
+                                 # 抢到机 / 升配成功 / 配置错误这类**事件推送**不受此开关影响，永远即时推。
 STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")   # 跨 run 状态（cache 挂载点）
 
 ALIVE_STATES = ("RUNNING", "STOPPED", "STARTING", "STOPPING", "PROVISIONING")
