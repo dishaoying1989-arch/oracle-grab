@@ -99,7 +99,9 @@ REPORT_SENT_DATE = ""            # 长棒模式下防止日报重复发
 POLL_INTERVAL = 15
 WAIT_RUNNING_TIMEOUT = 420       # Actions 里单 run 有时长预算，等 RUNNING 上限 7 分钟
 STATE_WAIT_TIMEOUT = 240
-REPORT_HOUR_BJ = 2               # 北京时间每天 02:00 发日报（老板定的体检推送时间点）
+REPORT_HOUR_BJ = -1              # 每日体检推送由 WorkBuddy 自动化（北京时间每天 02:00）负责，
+                                 # 云端这里关掉，避免一天收到两条微信。改回 0~23 即可恢复云端日报。
+                                 # 注意：抢到机 / 升配成功 / 配置错误这类**事件推送**不受此开关影响，永远会推。
 STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")   # 跨 run 状态（cache 挂载点）
 
 ALIVE_STATES = ("RUNNING", "STOPPED", "STARTING", "STOPPING", "PROVISIONING")
@@ -620,7 +622,7 @@ def main():
                 break
 
             # 日报：北京时间 02:00。长棒模式下必须放在循环内判断，否则整棒跨过 2 点会漏发
-            if not DRY_RUN:
+            if not DRY_RUN and REPORT_HOUR_BJ >= 0:
                 _n = datetime.datetime.now(TZ_BJ)
                 if _n.hour == REPORT_HOUR_BJ and REPORT_SENT_DATE != _n.strftime("%Y-%m-%d"):
                     globals()["REPORT_SENT_DATE"] = _n.strftime("%Y-%m-%d")
@@ -643,7 +645,7 @@ def main():
 
         # 日报：北京时间 02:00 所在 run（循环里已发过则跳过，避免重复推送）
         _n2 = datetime.datetime.now(TZ_BJ)
-        if _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
+        if REPORT_HOUR_BJ >= 0 and _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
             push("甲骨文抢机日报：{}".format(TIERS[cur2[0]]["label"] if cur2 else "尚未抢到"),
                  "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}".format(
