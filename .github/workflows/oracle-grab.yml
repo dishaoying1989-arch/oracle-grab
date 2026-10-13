@@ -25,8 +25,14 @@ name: Oracle Grab
 #   OCI 私钥 / Server酱 Key / SSH 公钥 / 接力用 PAT 全部存在 Secrets（加密存储），
 #   compartment 也改为由 OCI_CONFIG_JSON 里的 tenancy 推断。
 #
-# 链路断了怎么发现：每天北京时间 09:00 会发微信日报。哪天没收到，就是链断了，
-#   去 Actions 页面手动 Run workflow（relay 选 true）即可重新接上。
+# 推送安排（老板定：一天只发一条，且关机也要能收到）：
+#   每天北京时间 **02:00**，云端脚本发一条《战报 + 链路体检》合并日报 —— 跑在 GitHub 上，
+#   电脑关机/卸载 WorkBuddy 都不影响。体检部分（24h 运行次数、失败数、有无空档、有无重复棒）
+#   由脚本内的 chain_health() 只读查 GitHub API 生成。
+#   本机 WorkBuddy 的 02:25 体检自动化改为**静默巡检**：只修问题，不发日常推送
+#   （Server酱 Turbo 免费额度每天仅 5 条，省下来留给"抢到机"这类即时事件）。
+#   ⚠ 哪天 02:00 没收到日报，基本就是链断了 → 去 Actions 页面手动
+#     Run workflow（relay 选 true）即可重新接上。
 # ======================================================================================
 on:
   schedule:
@@ -83,6 +89,8 @@ jobs:
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           SSH_PUB_KEY: ${{ secrets.SSH_PUB_KEY }}
           GRAB_STATE_DIR: .grab_state
+          # 供脚本内 chain_health() 只读查本仓库 Actions 运行记录（体检信息并入 02:00 日报）
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "$(date +%s)" > /tmp/grab_start_ts
           python scripts/oracle_grab_actions.py \
