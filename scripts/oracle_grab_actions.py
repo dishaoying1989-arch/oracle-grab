@@ -101,12 +101,9 @@ ROUND_GAP_IDLE = 420             # 顶配巡检间隔
 GAP_INIT_CREATE = 180            # 自适应起始间隔（秒）
 GAP_MIN_CREATE = 90              # 下限：再顺畅也不快过 90s，给账号留安全边际
 GAP_MAX_CREATE = 600             # 上限：限流再重也最多退到 10 分钟一轮
-GAP_EWMA_ALPHA = 0.15            # 429 率平滑系数（越小越迟钝、越稳）
-GAP_HI = 0.15                    # 429 率高于此值 -> 拉大间隔
-GAP_LO = 0.03                    # 429 率低于此值 -> 提速
-GAP_MULT_UP = 1.35               # 退让倍数（拉大间隔）
-GAP_MULT_DOWN = 0.90             # 提速倍数（缩短间隔）
-GAP_UP_COOLDOWN = 2              # 连续多少次"无 429"才提速一次
+GAP_MULT_UP = 1.35               # 退让倍数（撞 429 就拉大间隔，反应要快）
+GAP_MULT_DOWN = 0.90             # 提速倍数（缩短间隔，小步试探）
+GAP_UP_COOLDOWN = 5              # 连续多少轮"无 429"才提速一次（防抖、防冒进）
 
 # 接力模式：单棒最长运行秒数（0=不限）。GitHub 单个 job 上限 6 小时，
 # workflow 传 19500（约 5.4 小时）跑满后优雅退场，再由 workflow 触发下一棒，
@@ -254,7 +251,6 @@ def classify_error(e):
 
 # ---------------- 自适应轮间隔 ----------------
 GAP_CREATE = GAP_INIT_CREATE
-_gap_ewma = None
 _gap_clean = 0
 GAP_FILE = os.path.join(STATE_DIR, "adaptive_gap.json")
 
@@ -279,25 +275,21 @@ def _save_gap(v):
 
 
 def adapt_gap(hit_rate_limit):
-    """撞 429 就拉大间隔，连续顺畅再小步提速（EWMA 平滑，避免抖动）。"""
-    global GAP_CREATE, _gap_ewma, _gap_clean
-    x = 1.0 if hit_rate_limit else 0.0
-    _gap_ewma = x if _gap_ewma is None else (
-        GAP_EWMA_ALPHA * x + (1 - GAP_EWMA_ALPHA) * _gap_ewma)
-    new = GAP_CREATE
-    if _gap_ewma > GAP_HI:
+    """撞 429 立刻拉大间隔；连续顺畅 GAP_UP_COOLDOWN 轮再小步提速（AIMD）。"""
+    global GAP_CREATE, _gap_clean
+    if hit_rate_limit:
         _gap_clean = 0
         new = min(GAP_CREATE * GAP_MULT_UP, GAP_MAX_CREATE)
-    elif _gap_ewma < GAP_LO:
-        _gap_clean += 1
-        if _gap_clean >= GAP_UP_COOLDOWN:
-            _gap_clean = 0
-            new = max(GAP_CREATE * GAP_MULT_DOWN, GAP_MIN_CREATE)
+        act = "退让"
     else:
+        _gap_clean += 1
+        if _gap_clean < GAP_UP_COOLDOWN:
+            return
         _gap_clean = 0
+        new = max(GAP_CREATE * GAP_MULT_DOWN, GAP_MIN_CREATE)
+        act = "提速"
     if abs(new - GAP_CREATE) >= 1:
-        print("[GAP] 近期429率≈{:.0f}% → 轮间隔 {}s -> {}s（自适应）".format(
-            _gap_ewma * 100, int(GAP_CREATE), int(new)))
+        print("[GAP] {} → 轮间隔 {}s -> {}s".format(act, int(GAP_CREATE), int(new)))
         GAP_CREATE = new
         _save_gap(new)
 
