@@ -86,9 +86,27 @@ TIERS = [
 ARM_SHAPE = "VM.Standard.A1.Flex"
 
 ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通过输入覆盖）
-ROUND_GAP_CREATE = 45            # 无实例时轮间隔（老板定：75s → 45s，抢机更勤；再往下会频繁撞 OCI 429 限流）
+ROUND_GAP_CREATE = 45            # 无实例时轮间隔**基准值**（自检/回退用；运行时走下面的自适应间隔）
 ROUND_GAP_RESIZE = 150           # 有实例时轮间隔
 ROUND_GAP_IDLE = 420             # 顶配巡检间隔
+
+# ---- 自适应轮间隔（AIMD 思路：撞 429 就退让，长时间不撞再慢慢提速）----
+# 起因：固定 45s 时实测每轮要撞 ~1.8 次 429，棒内 70% 的时间耗在退避等待上，
+#       既没换来更多有效探测，又一直把账号往"限死/封号"的方向顶。
+# 机制：维护 429 命中率的指数滑动平均（EWMA）：
+#       - 高于 GAP_HI -> 乘性拉大间隔（反应快，立刻让 OCI 喘口气）
+#       - 低于 GAP_LO -> 乘性缩短间隔（小步提速，去试探真实上限）
+#       - 介于两者之间 -> 保持不动（避免在阈值附近来回抖）
+# 自适应值会写进 .grab_state/adaptive_gap.json 跨棒保留，不用每棒从头试探。
+GAP_INIT_CREATE = 180            # 自适应起始间隔（秒）
+GAP_MIN_CREATE = 90              # 下限：再顺畅也不快过 90s，给账号留安全边际
+GAP_MAX_CREATE = 600             # 上限：限流再重也最多退到 10 分钟一轮
+GAP_EWMA_ALPHA = 0.15            # 429 率平滑系数（越小越迟钝、越稳）
+GAP_HI = 0.15                    # 429 率高于此值 -> 拉大间隔
+GAP_LO = 0.03                    # 429 率低于此值 -> 提速
+GAP_MULT_UP = 1.35               # 退让倍数（拉大间隔）
+GAP_MULT_DOWN = 0.90             # 提速倍数（缩短间隔）
+GAP_UP_COOLDOWN = 2              # 连续多少次"无 429"才提速一次
 
 # 接力模式：单棒最长运行秒数（0=不限）。GitHub 单个 job 上限 6 小时，
 # workflow 传 19500（约 5.4 小时）跑满后优雅退场，再由 workflow 触发下一棒，
@@ -181,7 +199,7 @@ def rate_limit_wait(err, attempt):
     return wait
 
 
-def call_with_rate_limit(func, *args, max_attempts=3, **kwargs):
+def call_with_rate_limit(func, *args, max_attempts=2, **kwargs):
     attempt = 0
     while True:
         try:
@@ -232,6 +250,56 @@ def classify_error(e):
     if is_network_error(e):
         return "network", str(e)
     return "error", str(e)
+
+
+# ---------------- 自适应轮间隔 ----------------
+GAP_CREATE = GAP_INIT_CREATE
+_gap_ewma = None
+_gap_clean = 0
+GAP_FILE = os.path.join(STATE_DIR, "adaptive_gap.json")
+
+
+def _load_gap():
+    try:
+        with open(GAP_FILE, "r", encoding="utf-8") as f:
+            v = float(json.load(f).get("gap_create", GAP_INIT_CREATE))
+        return min(max(v, GAP_MIN_CREATE), GAP_MAX_CREATE)
+    except Exception:
+        return GAP_INIT_CREATE
+
+
+def _save_gap(v):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(GAP_FILE, "w", encoding="utf-8") as f:
+            json.dump({"gap_create": round(float(v), 1), "updated": now_bj()},
+                      f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def adapt_gap(hit_rate_limit):
+    """撞 429 就拉大间隔，连续顺畅再小步提速（EWMA 平滑，避免抖动）。"""
+    global GAP_CREATE, _gap_ewma, _gap_clean
+    x = 1.0 if hit_rate_limit else 0.0
+    _gap_ewma = x if _gap_ewma is None else (
+        GAP_EWMA_ALPHA * x + (1 - GAP_EWMA_ALPHA) * _gap_ewma)
+    new = GAP_CREATE
+    if _gap_ewma > GAP_HI:
+        _gap_clean = 0
+        new = min(GAP_CREATE * GAP_MULT_UP, GAP_MAX_CREATE)
+    elif _gap_ewma < GAP_LO:
+        _gap_clean += 1
+        if _gap_clean >= GAP_UP_COOLDOWN:
+            _gap_clean = 0
+            new = max(GAP_CREATE * GAP_MULT_DOWN, GAP_MIN_CREATE)
+    else:
+        _gap_clean = 0
+    if abs(new - GAP_CREATE) >= 1:
+        print("[GAP] 近期429率≈{:.0f}% → 轮间隔 {}s -> {}s（自适应）".format(
+            _gap_ewma * 100, int(GAP_CREATE), int(new)))
+        GAP_CREATE = new
+        _save_gap(new)
 
 
 # ---------------- 跨 run 状态（今日累计计数） ----------------
@@ -546,9 +614,11 @@ def build_instance_table(compute):
 
 
 def run_summary():
-    return ("本次 run：{} 轮 | 新建 {} / 升配 {} | 成功 {} | 容量不足 {} | 限流 {} | 其他 {}").format(
+    return ("本次 run：{} 轮 | 新建 {} / 升配 {} | 成功 {} | 容量不足 {} | 限流 {} | 其他 {}\n"
+            "- 当前轮间隔：{}s（自适应，区间 {}~{}s）").format(
         RUN["rounds"], RUN["create_try"], RUN["resize_try"], RUN["success"],
-        RUN["capacity"], RUN["rate_limit"], RUN["error"])
+        RUN["capacity"], RUN["rate_limit"], RUN["error"],
+        int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE)
 
 
 # ---------------- 单轮 ----------------
@@ -640,9 +710,13 @@ def main():
         global MAX_SECONDS
         MAX_SECONDS = int(sys.argv[sys.argv.index("--max-seconds") + 1])
 
+    global GAP_CREATE
+    GAP_CREATE = _load_gap()
     print("=" * 60)
     print("甲骨文抢机 Actions 版启动 | 北京时间 {} | rounds={} dry={} status={}".format(
         now_bj(), ROUNDS, DRY_RUN, STATUS_ONLY))
+    print("[GAP] 自适应轮间隔起始 {}s（区间 {}~{}s）".format(
+        int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE))
     print("=" * 60)
 
     import oci
@@ -676,6 +750,10 @@ def main():
                     pass
                 event, fail = None, None
 
+            # 自适应节奏：本轮撞到 429 就拉大间隔，连续顺畅再小步提速
+            if not DRY_RUN:
+                adapt_gap(bool(fail and fail.get("type") == "rate_limit"))
+
             if event and not DRY_RUN:
                 push(event[0], event[1] + "\n\n---\n" + run_summary() + "\n\n" + daily_summary())
                 events_sent = True
@@ -704,7 +782,7 @@ def main():
 
             if r < ROUNDS:
                 c = get_current_tier(arms)
-                gap = ROUND_GAP_CREATE if c is None else (
+                gap = GAP_CREATE if c is None else (
                     ROUND_GAP_IDLE if c[0] == len(TIERS) - 1 else ROUND_GAP_RESIZE)
                 gap = jitter(gap)
                 print("[WAIT] {}s".format(gap))
