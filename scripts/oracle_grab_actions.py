@@ -49,6 +49,9 @@ RUN = {
     "capacity": 0, "rate_limit": 0, "network": 0, "error": 0,
 }
 
+# 跨 run 状态（cache 挂载点）；必须尽早定义 —— 下面的 CAPPED_TIER_FILE 在模块加载期就会引用它
+STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")
+
 # ---------------- 配置（全部来自环境变量） ----------------
 SEND_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 PUSH_URL = "https://sctapi.ftqq.com/{}.send".format(SEND_KEY) if SEND_KEY else ""
@@ -84,6 +87,19 @@ TIERS = [
     {"ocpus": 4, "memory_gb": 24, "label": "4核24G"},
 ]
 ARM_SHAPE = "VM.Standard.A1.Flex"
+
+# 多 AD 轮换（开源最佳实践：大阪/东京等多数区域有 3 个 AD，容量可能只出现在某一个）。
+# 本账号实测只有 1 个 AD（AD-1），所以是 no-op；但代码保留轮换能力，换区域/换账号即自动生效。
+AD_LIST = []
+AD_IDX = 0
+
+# 账户 A1 免费额度上限探测（应对 Oracle 2026-06-15 把免费档从 4C/24G 砍到 2C/12G 的政策）。
+# CAPPED_TIER = 不可超过的最高 tier 索引；默认 len(TIERS)（不封顶）。
+# 一旦某次新建/升配因「service limits were exceeded（standard-a1-core/memory-count）」失败，
+# 即说明该账户免费档到不了这一档（纯免费档被砍），把 CAPPED_TIER 压到这一档，
+# 之后不再浪费尝试，并写入 account_cap.json 跨日保留（额度是账户级属性，不会天天变）。
+CAPPED_TIER_FILE = os.path.join(STATE_DIR, "account_cap.json")
+CAPPED_TIER = len(TIERS) - 1          # 允许尝试的最高 tier 索引（默认顶配；撞 limit 后下调，最低 -1=账户免A1额度为0）
 
 ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通过输入覆盖）
 ROUND_GAP_CREATE = 45            # 无实例时轮间隔**基准值**（自检/回退用；运行时走下面的自适应间隔）
@@ -123,7 +139,7 @@ REPORT_HOUR_BJ = 2               # 北京时间每天 **02:00** 云端发「战�
                                  # 日报内容已包含链路体检（见 chain_health()），所以不需要第二条。
                                  # 想彻底关掉日报：把这里改成 -1。
                                  # 抢到机 / 升配成功 / 配置错误这类**事件推送**不受此开关影响，永远即时推。
-STATE_DIR = os.environ.get("GRAB_STATE_DIR", ".grab_state")   # 跨 run 状态（cache 挂载点）
+# （STATE_DIR 已在上方「配置」段之前定义，这里不再重复）
 
 ALIVE_STATES = ("RUNNING", "STOPPED", "STARTING", "STOPPING", "PROVISIONING")
 DEAD_STATES = ("TERMINATED", "TERMINATING")
@@ -143,6 +159,22 @@ def now_bj():
 
 def jitter(base, spread=0.25):
     return int(base * (1 + random.uniform(-spread, spread)))
+
+
+def current_ad():
+    """当前轮使用的可用域：在 AD_LIST 上按 AD_IDX 轮换（开源最佳实践，撞容量不足就换个 AD 再试）。"""
+    global AD_IDX
+    if AD_LIST:
+        return AD_LIST[AD_IDX % len(AD_LIST)]
+    return AVAILABILITY_DOMAIN
+
+
+def rotate_ad():
+    """容量不足时切到下一个 AD（无货的 AD 再怎么蹲也出不来容量）。"""
+    global AD_IDX
+    if len(AD_LIST) > 1:
+        AD_IDX = (AD_IDX + 1) % len(AD_LIST)
+        print("[AD] 容量不足，轮换到 {}".format(current_ad()))
 
 
 def push(title, desp):
@@ -184,14 +216,20 @@ def get_retry_after(err):
     return None
 
 
+# 最近一次 429 时 OCI 在响应头里给出的退避秒数（供 AIMD 直接采纳）
+LAST_RETRY_AFTER = None
+
+
 def rate_limit_wait(err, attempt):
     # Actions 单 run 有 12 分钟预算，退避上限收紧到 120s，总重试不超过 ~6 分钟
+    global LAST_RETRY_AFTER
     wait = get_retry_after(err)
+    LAST_RETRY_AFTER = wait
     if wait is None:
         wait = min(30 * (2 ** attempt), 120)
     wait = min(int(wait), 120)
     RUN["rate_limit"] += 1
-    print("[RATE-LIMIT] 等待 {}s".format(wait))
+    print("[RATE-LIMIT] 等待 {}s{}".format(wait, " (Retry-After)" if LAST_RETRY_AFTER else ""))
     time.sleep(wait)
     return wait
 
@@ -233,13 +271,23 @@ def classify_error(e):
     if e.__class__.__name__ == "ServiceError":
         msg = "{} | code={} | status={}".format(e.message, e.code, e.status)
         low = (str(e.message) or "").lower()
-        if e.status == 429 or "toomany" in (e.code or "").lower() or "throttle" in (e.code or "").lower():
+        code = (e.code or "").upper()
+        if e.status == 429 or "toomany" in code.lower() or "throttle" in code.lower():
             return "rate_limit", msg
         if any(k in low for k in CAPACITY_KEYWORDS):
             return "capacity", msg
+        # 配额到顶：账户免费档到不了这个规格（最常见是 2026-06-15 政策后纯免费档封顶 2C/12G）。
+        # 与「暂时没货」(capacity) 必须分开 —— 前者是硬限制，再怎么重试也没用，应封顶。
+        if ("service limits were exceeded" in low
+                or "service limit" in low
+                or "standard-a1-core-count" in low
+                or "standard-a1-memory-count" in low
+                or "limit exceeded" in low
+                or code == "LIMITEXCEEDED"):
+            return "limit", msg
         if any(k in low for k in NEED_STOP_KEYWORDS):
             return "need_stop", msg
-        if "quota" in low or "service limit" in low:
+        if "quota" in low:
             return "quota", msg
         if e.status in (401, 404):
             return "config", msg
@@ -274,13 +322,44 @@ def _save_gap(v):
         pass
 
 
-def adapt_gap(hit_rate_limit):
-    """撞 429 立刻拉大间隔；连续顺畅 GAP_UP_COOLDOWN 轮再小步提速（AIMD）。"""
+def _load_cap():
+    """读取账户 A1 免费档上限（跨日保留；额度是账户级属性，不会天天变）。"""
+    global CAPPED_TIER
+    try:
+        with open(CAPPED_TIER_FILE, "r", encoding="utf-8") as f:
+            v = int(json.load(f).get("capped_tier", len(TIERS)))
+        CAPPED_TIER = min(max(v, -1), len(TIERS) - 1)
+    except Exception:
+        CAPPED_TIER = len(TIERS) - 1
+    return CAPPED_TIER
+
+
+def _save_cap(v):
+    global CAPPED_TIER
+    CAPPED_TIER = min(max(int(v), -1), len(TIERS) - 1)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(CAPPED_TIER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"capped_tier": CAPPED_TIER, "updated": now_bj(),
+                       "label": "无（账户免费 A1 额度为 0）" if CAPPED_TIER < 0
+                       else TIERS[CAPPED_TIER]["label"]},
+                      f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def adapt_gap(hit_rate_limit, retry_after=None):
+    """撞 429 立刻拉大间隔；连续顺畅 GAP_UP_COOLDOWN 轮再小步提速（AIMD）。
+    retry_after：OCI 在 429 响应头给的退避秒数 —— 它比我们猜的准，优先采纳（封顶在区间内）。"""
     global GAP_CREATE, _gap_clean
     if hit_rate_limit:
         _gap_clean = 0
-        new = min(GAP_CREATE * GAP_MULT_UP, GAP_MAX_CREATE)
-        act = "退让"
+        if retry_after and retry_after > 0:
+            new = min(max(retry_after, GAP_MIN_CREATE), GAP_MAX_CREATE)
+            act = "退让(遵从Retry-After)"
+        else:
+            new = min(GAP_CREATE * GAP_MULT_UP, GAP_MAX_CREATE)
+            act = "退让"
     else:
         _gap_clean += 1
         if _gap_clean < GAP_UP_COOLDOWN:
@@ -423,16 +502,28 @@ def init_clients():
     compute = oci.core.ComputeClient(cfg)
     identity = oci.identity.IdentityClient(cfg)
 
+    # 关键：关掉 OCI SDK 自带的默认重试/退避。它的默认策略会在单次调用里对 429/5xx
+    # 指数退避重试好几分钟，导致我们自己的 AIMD 节奏形同虚设、日志看起来像卡死。
+    # 关掉后所有重试都由我们的 call_with_rate_limit / call_with_net_retry 显式掌控。
+    try:
+        compute.retry_strategy = oci.retry.NoneRetryStrategy()
+        identity.retry_strategy = oci.retry.NoneRetryStrategy()
+    except Exception:
+        pass
+
     # 自动探测 AD 与最新 Ubuntu 24.04 ARM 镜像（失败回退硬编码）
-    global AVAILABILITY_DOMAIN, ARM_IMAGE_ID
+    global AVAILABILITY_DOMAIN, ARM_IMAGE_ID, AD_LIST
     try:
         names = [a.name for a in call_with_net_retry(
             identity.list_availability_domains, compartment_id=COMPARTMENT_ID).data]
+        AD_LIST = list(names)
         if names:
             AVAILABILITY_DOMAIN = names[0]
-            print("[AD]", AVAILABILITY_DOMAIN)
+            print("[AD] 探测到 {} 个 AD，启用轮换：{}".format(len(names), "、".join(names)))
     except Exception as e:
         print("[AD] 探测失败，用回退值:", str(e)[:100])
+    if not AD_LIST:
+        AD_LIST = [AVAILABILITY_DOMAIN]
     try:
         for im in call_with_net_retry(
                 compute.list_images, compartment_id=COMPARTMENT_ID,
@@ -518,7 +609,7 @@ def action_create(compute, tier, dry_run=False):
         return "dry-run-id", "dry-run", None
     details = oci.core.models.LaunchInstanceDetails(
         compartment_id=COMPARTMENT_ID,
-        availability_domain=AVAILABILITY_DOMAIN,
+        availability_domain=current_ad(),
         display_name="arm-a1-{}ocpu-{}gb".format(tier["ocpus"], tier["memory_gb"]),
         shape=ARM_SHAPE,
         shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
@@ -606,11 +697,13 @@ def build_instance_table(compute):
 
 
 def run_summary():
+    cap_label = "无（账户免A1额度为0）" if CAPPED_TIER < 0 else TIERS[CAPPED_TIER]["label"]
     return ("本次 run：{} 轮 | 新建 {} / 升配 {} | 成功 {} | 容量不足 {} | 限流 {} | 其他 {}\n"
-            "- 当前轮间隔：{}s（自适应，区间 {}~{}s）").format(
+            "- 当前轮间隔：{}s（自适应，区间 {}~{}s）\n"
+            "- 账户 A1 免费档封顶：{}（撞 limit 自动下调）").format(
         RUN["rounds"], RUN["create_try"], RUN["resize_try"], RUN["success"],
         RUN["capacity"], RUN["rate_limit"], RUN["error"],
-        int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE)
+        int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE, cap_label)
 
 
 # ---------------- 单轮 ----------------
@@ -621,13 +714,21 @@ def do_round(compute, arms):
 
     # A. 无实例 -> 抢保底
     if cur is None:
+        if CAPPED_TIER < 0:
+            print("[ROUND] 账户免A1额度为0（已封顶），跳过创建，仅巡检")
+            return arms, None, None
         t = TIERS[0]
-        print("[ROUND] 无 ARM，抢保底 {}".format(t["label"]))
+        print("[ROUND] 无 ARM，抢保底 {}（AD={}）".format(t["label"], current_ad()))
         inst_id, name, fail = action_create(compute, t, dry_run=DRY_RUN)
         if inst_id is None:
             ftype = fail.get("type", "error") if fail else "error"
             if ftype == "capacity":
                 RUN["capacity"] += 1
+                rotate_ad()                      # 这个 AD 没货，下一轮换 AD 再试
+            elif ftype == "limit":
+                # 连最小的 1C/6G 都超 free 配额 -> 账户免 A1 额度为 0，永久封顶（跨日保留）
+                _save_cap(-1)
+                print("[ROUND] 账户免A1额度为0，已永久封顶，后续不再创建")
             elif ftype == "network":
                 RUN["network"] += 1
             elif ftype not in ("rate_limit",):
@@ -651,9 +752,10 @@ def do_round(compute, arms):
                   t["label"], ip, ip, quota_text([t]), build_instance_table(compute)))
         return list_arm_instances(compute), ev, None
 
-    # B. 顶配 -> 巡检
-    if idx == len(TIERS) - 1:
-        print("[ROUND] 已达顶配")
+    # B. 已达封顶档位 -> 巡检（封顶可能是账户 free 配额上限，未必是 4C/24G）
+    if idx >= CAPPED_TIER:
+        cap_label = TIERS[CAPPED_TIER]["label"] if CAPPED_TIER >= 0 else "无（账户免A1额度为0）"
+        print("[ROUND] 已达封顶档位 {}，巡检".format(cap_label))
         return arms, None, None
 
     # C. 原地升配
@@ -683,6 +785,12 @@ def do_round(compute, arms):
     if ftype == "capacity":
         RUN["capacity"] += 1
         print("[ROUND] 容量不足，继续蹲守")
+    elif ftype == "limit":
+        # 升配到 target 超出 free 配额（最常见：2026-06-15 政策后纯免费档封顶 2C/12G）。
+        # 封顶到当前档 idx，后续只蹲守此档，不再越级白耗尝试。
+        _save_cap(idx)
+        print("[ROUND] 升配超出免费额度，封顶到 {}，后续只蹲守此档".format(
+            TIERS[idx]["label"] if idx >= 0 else "无"))
     elif ftype == "rate_limit":
         print("[ROUND] 限流")
     elif ftype == "network":
@@ -704,11 +812,14 @@ def main():
 
     global GAP_CREATE
     GAP_CREATE = _load_gap()
+    _load_cap()                              # 读取账户免费 A1 档位封顶（跨日保留）
     print("=" * 60)
     print("甲骨文抢机 Actions 版启动 | 北京时间 {} | rounds={} dry={} status={}".format(
         now_bj(), ROUNDS, DRY_RUN, STATUS_ONLY))
     print("[GAP] 自适应轮间隔起始 {}s（区间 {}~{}s）".format(
         int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE))
+    cap_label = "无（账户免A1额度为0）" if CAPPED_TIER < 0 else TIERS[CAPPED_TIER]["label"]
+    print("[CAP] 账户 A1 免费档封顶：{}（撞 limit 自动下调，跨日保留）".format(cap_label))
     print("=" * 60)
 
     import oci
@@ -742,9 +853,10 @@ def main():
                     pass
                 event, fail = None, None
 
-            # 自适应节奏：本轮撞到 429 就拉大间隔，连续顺畅再小步提速
+            # 自适应节奏：本轮撞到 429 就拉大间隔（优先遵从 OCI 的 Retry-After），连续顺畅再小步提速
             if not DRY_RUN:
-                adapt_gap(bool(fail and fail.get("type") == "rate_limit"))
+                adapt_gap(bool(fail and fail.get("type") == "rate_limit"),
+                          retry_after=LAST_RETRY_AFTER)
 
             if event and not DRY_RUN:
                 push(event[0], event[1] + "\n\n---\n" + run_summary() + "\n\n" + daily_summary())
