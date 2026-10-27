@@ -100,6 +100,14 @@ AD_IDX = 0
 # 之后不再浪费尝试，并写入 account_cap.json 跨日保留（额度是账户级属性，不会天天变）。
 CAPPED_TIER_FILE = os.path.join(STATE_DIR, "account_cap.json")
 CAPPED_TIER = len(TIERS) - 1          # 允许尝试的最高 tier 索引（默认顶配；撞 limit 后下调，最低 -1=账户免A1额度为0）
+CAP_TS = 0                            # account_cap.json 的写入时间（epoch 秒），用于定期复核
+# 复核周期：判定"账户免 A1 额度为 0"（cap=-1）之后，每隔这么多小时用 Limits API 实测一次。
+# 起因（2026-10-28 踩坑）：某一轮紧跟 429 之后的 limit 报错被误判成"额度为 0"，永久封顶写进
+# account_cap.json 后整条链只剩巡检、再也没创建过实例 —— 而实测账号其实还有 2核/12G 免费额度。
+# 单次瞬时 limit 不该把链路永久废掉，所以加定期复核 + 现场实测再下结论。
+CAP_REPROBE_HOURS = 6
+_LIMITS_CLIENT = None                 # Limits 客户端（惰性创建，仅用于只读配额探测）
+CFG = None                            # OCI 配置（init_clients 里落库，供 Limits 探测复用）
 
 ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通过输入覆盖）
 ROUND_GAP_CREATE = 45            # 无实例时轮间隔**基准值**（自检/回退用；运行时走下面的自适应间隔）
@@ -323,29 +331,91 @@ def _save_gap(v):
 
 
 def _load_cap():
-    """读取账户 A1 免费档上限（跨日保留；额度是账户级属性，不会天天变）。"""
-    global CAPPED_TIER
+    """读取账户 A1 免费档上限（跨日保留；额度是账户级属性，但 Oracle 会调整/回收）。"""
+    global CAPPED_TIER, CAP_TS
     try:
         with open(CAPPED_TIER_FILE, "r", encoding="utf-8") as f:
-            v = int(json.load(f).get("capped_tier", len(TIERS)))
+            d = json.load(f)
+        v = int(d.get("capped_tier", len(TIERS)))
         CAPPED_TIER = min(max(v, -1), len(TIERS) - 1)
+        try:
+            CAP_TS = int(d.get("ts") or 0)
+        except Exception:
+            CAP_TS = 0
     except Exception:
         CAPPED_TIER = len(TIERS) - 1
+        CAP_TS = 0
     return CAPPED_TIER
 
 
 def _save_cap(v):
-    global CAPPED_TIER
+    global CAPPED_TIER, CAP_TS
     CAPPED_TIER = min(max(int(v), -1), len(TIERS) - 1)
+    CAP_TS = int(time.time())
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(CAPPED_TIER_FILE, "w", encoding="utf-8") as f:
-            json.dump({"capped_tier": CAPPED_TIER, "updated": now_bj(),
+            json.dump({"capped_tier": CAPPED_TIER, "updated": now_bj(), "ts": CAP_TS,
                        "label": "无（账户免费 A1 额度为 0）" if CAPPED_TIER < 0
                        else TIERS[CAPPED_TIER]["label"]},
                       f, ensure_ascii=False)
     except Exception:
         pass
+
+
+def probe_a1_availability():
+    """只读查询账户 A1 免费配额剩余量（Limits API：不创建实例、不消耗 create 限流额度）。
+    返回 (可用核数, 可用内存GB)；探测失败返回 None。"""
+    global _LIMITS_CLIENT
+    try:
+        import oci
+        if _LIMITS_CLIENT is None:
+            if not CFG:
+                return None
+            _LIMITS_CLIENT = oci.limits.LimitsClient(CFG)
+            try:
+                _LIMITS_CLIENT.retry_strategy = oci.retry.NoneRetryStrategy()
+            except Exception:
+                pass
+        ad = current_ad()
+        cores = call_with_net_retry(
+            _LIMITS_CLIENT.get_resource_availability,
+            service_name="compute", limit_name="standard-a1-core-count",
+            compartment_id=COMPARTMENT_ID, availability_domain=ad).data.available
+        mem = None
+        try:
+            mem = call_with_net_retry(
+                _LIMITS_CLIENT.get_resource_availability,
+                service_name="compute", limit_name="standard-a1-memory-count",
+                compartment_id=COMPARTMENT_ID, availability_domain=ad).data.available
+        except Exception:
+            pass
+        return (cores, mem)
+    except Exception as e:
+        print("[CAP-PROBE] 配额探测失败:", str(e)[:120])
+        return None
+
+
+def maybe_unbrick_cap():
+    """cap=-1（曾判定"零额度"）每隔 CAP_REPROBE_HOURS 小时实测复核一次；配额其实还在就解除封顶。
+    返回 True 表示本次做了复核并可能改变了封顶值。"""
+    global CAPPED_TIER
+    if CAPPED_TIER >= 0:
+        return False
+    if CAP_TS and (time.time() - CAP_TS) < CAP_REPROBE_HOURS * 3600:
+        return False
+    q = probe_a1_availability()
+    if q is None:
+        return False
+    cores, mem = q
+    if (cores or 0) >= 1 and (mem is None or (mem or 0) >= 6):
+        _save_cap(len(TIERS) - 1)
+        print("[CAP-HEAL] 实测仍有 A1 额度 {}核/{}G → 解除'零额度'封顶，恢复创建".format(cores, mem))
+    else:
+        _save_cap(-1)
+        print("[CAP-HEAL] 实测 A1 额度 {}核/{}G → 维持零额度封顶（{}h 后再复核）".format(
+            cores, mem, CAP_REPROBE_HOURS))
+    return True
 
 
 def adapt_gap(hit_rate_limit, retry_after=None):
@@ -483,6 +553,7 @@ def chain_health():
 # ---------------- OCI 初始化 ----------------
 def init_clients():
     import oci
+    global CFG
     if not OCI_CONFIG_JSON or not OCI_PRIVATE_KEY:
         raise RuntimeError("缺少 Secrets：OCI_CONFIG_JSON / OCI_PRIVATE_KEY 未配置")
     if not COMPARTMENT_ID:
@@ -499,6 +570,7 @@ def init_clients():
     oci.config.validate_config(cfg)
     cfg.setdefault("connection_timeout", 30)
     cfg.setdefault("read_timeout", 90)
+    CFG = cfg                             # 供 Limits 配额探测复用同一份配置
     compute = oci.core.ComputeClient(cfg)
     identity = oci.identity.IdentityClient(cfg)
 
@@ -726,9 +798,16 @@ def do_round(compute, arms):
                 RUN["capacity"] += 1
                 rotate_ad()                      # 这个 AD 没货，下一轮换 AD 再试
             elif ftype == "limit":
-                # 连最小的 1C/6G 都超 free 配额 -> 账户免 A1 额度为 0，永久封顶（跨日保留）
-                _save_cap(-1)
-                print("[ROUND] 账户免A1额度为0，已永久封顶，后续不再创建")
+                # 连最小的 1C/6G 都报 limit，先别急着"永久封顶"：紧跟 429 重试之后的 limit 常是瞬时误报
+                # （2026-10-27 就因此把整条链钉死在"零额度"，实际账号还有 2核/12G）。
+                # 用 Limits API 实测剩余配额：还有额度就只当本轮没抢到，确认为 0 才封顶。
+                q = probe_a1_availability()
+                if q is not None and (q[0] or 0) >= 1 and (q[1] is None or (q[1] or 0) >= 6):
+                    RUN["capacity"] += 1
+                    print("[ROUND] 报 limit 但实测仍有额度 {}核/{}G → 判瞬时误报，不封顶".format(q[0], q[1]))
+                else:
+                    _save_cap(-1)
+                    print("[ROUND] 账户免A1额度为0，已封顶（{}h 后自动实测复核）".format(CAP_REPROBE_HOURS))
             elif ftype == "network":
                 RUN["network"] += 1
             elif ftype not in ("rate_limit",):
@@ -825,6 +904,9 @@ def main():
     import oci
     try:
         compute = init_clients()
+        if maybe_unbrick_cap():
+            print("[CAP] 复核后封顶：{}".format(
+                "无（账户免A1额度为0）" if CAPPED_TIER < 0 else TIERS[CAPPED_TIER]["label"]))
         arms = list_arm_instances(compute)
         cur = get_current_tier(arms)
         print("[状态] ARM {} 台 | 档位 {} | 额度 {}".format(
