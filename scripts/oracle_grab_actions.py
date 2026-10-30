@@ -8,7 +8,7 @@
     下一整点由 cron 再次拉起 —— 全天不间断，且永远不超出私有仓库分钟额度。
 
 核心策略（与本地 v3 一致）：
-    1. 无 ARM 实例 -> 抢保底 1核6G（新建）
+    1. 无 ARM 实例 -> 抢保底 1核1G（新建，1核6G 排不上时的兜底）
     2. 已有实例未顶配 -> **原地升配**（update_instance 改 shape_config，不删机重建）
        在线改配失败且提示需停机 -> STOP -> 改配 -> START（公网IP/启动盘保留）
     3. 已达顶配 4核24G -> 只巡检 + 日报
@@ -82,6 +82,7 @@ FREE_TOTAL_OCPUS = 4
 FREE_TOTAL_MEM_GB = 24
 
 TIERS = [
+    {"ocpus": 1, "memory_gb": 1,  "label": "1核1G"},
     {"ocpus": 1, "memory_gb": 6,  "label": "1核6G"},
     {"ocpus": 2, "memory_gb": 12, "label": "2核12G"},
     {"ocpus": 4, "memory_gb": 24, "label": "4核24G"},
@@ -408,7 +409,7 @@ def maybe_unbrick_cap():
     if q is None:
         return False
     cores, mem = q
-    if (cores or 0) >= 1 and (mem is None or (mem or 0) >= 6):
+    if (cores or 0) >= 1 and (mem is None or (mem or 0) >= 1):
         _save_cap(len(TIERS) - 1)
         print("[CAP-HEAL] 实测仍有 A1 额度 {}核/{}G → 解除'零额度'封顶，恢复创建".format(cores, mem))
     else:
@@ -628,7 +629,14 @@ def list_arm_instances(compute):
 def get_current_tier(arms):
     if not arms:
         return None
-    best = max(arms, key=lambda x: x["ocpus"])
+    best = max(arms, key=lambda x: (x["ocpus"], x.get("memory_gb") or 0))
+    for i, t in enumerate(TIERS):
+        # 必须同时匹配核数与内存：TIERS 里 1核1G 与 1核6G 核数相同，
+        # 只比核数会把 1核6G 实例误判成 1核1G（2026-10-30 复核发现）。
+        if abs(best["ocpus"] - t["ocpus"]) < 0.5 and \
+                abs((best.get("memory_gb") or 0) - t["memory_gb"]) < 0.5:
+            return i, best
+    # 内存对不上时退回按核数匹配（老实例可能缺 memory_gb 字段）
     for i, t in enumerate(TIERS):
         if abs(best["ocpus"] - t["ocpus"]) < 0.5:
             return i, best
@@ -798,11 +806,11 @@ def do_round(compute, arms):
                 RUN["capacity"] += 1
                 rotate_ad()                      # 这个 AD 没货，下一轮换 AD 再试
             elif ftype == "limit":
-                # 连最小的 1C/6G 都报 limit，先别急着"永久封顶"：紧跟 429 重试之后的 limit 常是瞬时误报
+                # 连最小的 1C/1G 都报 limit，先别急着"永久封顶"：紧跟 429 重试之后的 limit 常是瞬时误报
                 # （2026-10-27 就因此把整条链钉死在"零额度"，实际账号还有 2核/12G）。
                 # 用 Limits API 实测剩余配额：还有额度就只当本轮没抢到，确认为 0 才封顶。
                 q = probe_a1_availability()
-                if q is not None and (q[0] or 0) >= 1 and (q[1] is None or (q[1] or 0) >= 6):
+                if q is not None and (q[0] or 0) >= 1 and (q[1] is None or (q[1] or 0) >= 1):
                     RUN["capacity"] += 1
                     print("[ROUND] 报 limit 但实测仍有额度 {}核/{}G → 判瞬时误报，不封顶".format(q[0], q[1]))
                 else:
