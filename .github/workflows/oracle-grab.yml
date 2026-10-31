@@ -10,7 +10,8 @@ name: Oracle Grab
 #           token scope、账号状态、是否 fork、有无阻塞中的 run。
 #   ⚠ 注：不能推广成"私有仓库 schedule 都不投递" —— 另一个账号下的私有仓库
 #     dishaoying/oracle-grab 有 2 次成功的 schedule 运行。只能说本仓库/本账号的
-#     定时投递有问题，根因未明。
+#     定时投递有问题，根因未明。（2026-10-30 起观察到 schedule 恢复投递，每小时
+#     07/37 分两个 cron 均正常触发，作为链路断掉时的兜底短棒继续保留。）
 #
 # 现在怎么做：
 #   单次 run 连续抢 5.4 小时（GitHub 单个 job 上限 6 小时，留 30 分钟缓冲），
@@ -110,8 +111,13 @@ jobs:
 
       # 接力：本棒快跑满时启动下一棒。用 PAT 而非 GITHUB_TOKEN
       # （GITHUB_TOKEN 触发的事件不会再唤起新的 workflow，会断链）
+      # 2026-10-31 加固：#261 交棒时 dispatch 被 GitHub 静默吞掉（无报错、无新 run），
+      # 链路断了 40 小时才发现。现在：状态回显 + 失败重试 + 确认新 run 真的出现了才算成功。
+      # 多次 dispatch 是安全的：concurrency 组里新的 pending 会取代旧的 pending，绝不会双棒同抢。
       - name: 接力下一棒
         if: always() && github.event.inputs.relay == 'true'
+        env:
+          PAT: ${{ secrets.GH_PAT }}
         run: |
           st=$(cat /tmp/grab_start_ts 2>/dev/null || echo 0)
           el=$(( $(date +%s) - st ))
@@ -120,9 +126,34 @@ jobs:
             echo "⚠ 本棒异常早退（不足 5 分钟），不接力，避免空转循环"
             exit 0
           fi
-          echo "=> 触发下一棒"
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oracle-grab.yml/dispatches \
-            -d '{"ref":"main","inputs":{"relay":"true"}}'
+          cur=${{ github.run_number }}
+          for a in 1 2 3 4 5; do
+            code=$(curl -sS -X POST -o /tmp/disp_resp.txt -w "%{http_code}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $PAT" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/oracle-grab.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"relay":"true"}}')
+            echo "第 $a 次触发下一棒：HTTP $code"
+            if [ "$code" != "204" ]; then
+              echo "触发失败，响应体："; cat /tmp/disp_resp.txt; echo
+              sleep 10
+              continue
+            fi
+            # 204 ≠ 万无一失：GitHub 偶发把 dispatch 静默吞掉，必须看到新 run 才算数
+            for v in 1 2 3 4 5; do
+              sleep 15
+              latest=$(curl -sS -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $PAT" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/runs?event=workflow_dispatch&per_page=1" \
+                | jq -r '.workflow_runs[0].run_number // 0')
+              echo "  校验 $v：最新接力 run = #$latest（本棒 #$cur）"
+              if [ "${latest:-0}" -gt "$cur" ] 2>/dev/null; then
+                echo "✅ 下一棒 #$latest 已启动，接力成功"
+                exit 0
+              fi
+            done
+            echo "⚠ dispatch 返回 204 但 75 秒内未见新 run（疑似被静默吞掉），重试"
+          done
+          echo "❌ 接力失败：5 次触发均未确认新 run，链路将断 —— 查 GH_PAT 是否有效、
+          或去 Actions 页面手动 Run workflow（relay=true）"
+          exit 1
