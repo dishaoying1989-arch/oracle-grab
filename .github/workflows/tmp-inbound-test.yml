@@ -8,5 +8,6 @@ jobs:
       - name: Pull from VPS
         run: |
           echo "runner IP: $(curl -s https://api.ipify.org)"
-          curl -s -o /dev/null -w "speed=%{speed_download} B/s time=%{time_total}s\n" --max-time 60 http://140.83.58.8:18080/big.bin
-          curl -s -o /dev/null -w "speed2=%{speed_download} B/s\n" --max-time 60 http://140.83.58.8:18080/big.bin
+          for i in 1 2 3; do
+            curl -s -o /dev/null -w "  pull$i: %{speed_download} B/s\n" --max-time 40 http://140.83.58.8:80/big.bin
+          done
