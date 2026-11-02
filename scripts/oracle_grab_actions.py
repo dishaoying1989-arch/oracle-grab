@@ -949,6 +949,289 @@ def action_resize_via_stop(compute, inst_id, target):
     return True, None
 
 
+# ---------------- Always Free 空闲回收风险自检 ----------------
+# 背景（2026-11-02 核对 Oracle 官方文档 Always Free Resources 原文）：
+#   "Oracle will deem virtual machine and bare metal compute instances as idle if,
+#    during a 7-day period, the following are true:
+#      - CPU utilization for the 95th percentile is less than 20%
+#      - Network utilization is less than 20%
+#      - Memory utilization is less than 20%  (applies to A1 shapes only)"
+#   ⇒ 三项「同时成立」才判空闲；任意一项越过 20% 就不会被回收。
+#
+# 为什么用 OCI Monitoring 而不是 SSH 上来跑 sar：
+#   - 云端 Actions 已有 OCI 凭据，不用给 VPS 再配一份密钥（少一条泄露路径）；
+#   - Monitoring 的 CpuUtilization / NetworksBytesIn 就是 Oracle 自己判定回收时看的那份数据，
+#     比我在机器上算的 sar 更贴近判据视角（sar 看到的是 guest 视角，OCI 看到的是实例视角）。
+#
+# 数据来源与口径（全部实测确认，2026-11-02）：
+#   - 端点：POST /metrics/actions/summarizeMetricsData（注意不是 /metrics，前者是查指标目录）
+#   - 查询语法是 MQL：`MetricName[1m]{dimension = "value"}.agg()`，
+#     metricName 不能写在 body 的独立字段里（SDK 也不接受），必须嵌进 query 字符串。
+#   - 指标名：CpuUtilization / MemoryUtilization / **NetworksBytesIn**（是复数 Networks！）/ NetworksBytesOut
+#   - 网络字节是**累计计数器**（单调递增），必须差分成速率再折算百分比，不能直接取值。
+#   - 形状带宽上限从 list_shapes 的 networking_bandwidth_in_gbps 取（E2.1.Micro = 0.48Gbps）。
+#     ⚠ 别用「50Mbps」这种印象数据 —— 实测 API 给的是 480Mbps，两者差 10 倍。
+
+RECLAIM_WINDOW_DAYS = 7              # 官方判据的窗口长度
+RECLAIM_THRESHOLD_PCT = 20.0         # 官方阈值
+RECLAIM_RESOLUTION = "1h"            # 采样分辨率（1h 聚合，避免 1m×7天=10080 点把接口拖超时）
+RECLAIM_SHAPE_BW_Gbps = {}           # 形状带宽缓存：shape -> Gbps
+_MONITORING_CLIENT = None            # Monitoring 客户端（惰性创建）
+
+
+def _pct(vals, p):
+    """线性插值分位数（避免引入 numpy 依赖）"""
+    if not vals:
+        return None
+    s = sorted(vals)
+    if len(s) == 1:
+        return float(s[0])
+    k = (len(s) - 1) * (float(p) / 100.0)
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _monitoring_client():
+    """Monitoring 客户端。
+    ⚠ 不能复用 ComputeClient 的 base_client —— 那是 compute 服务端点，
+      打 Monitoring 的路径会 404（NotAuthorizedOrNotFound，迷惑性很强）。
+      Monitoring 走的是 telemetry.<region>.oraclecloud.com。"""
+    global _MONITORING_CLIENT
+    if _MONITORING_CLIENT is not None:
+        return _MONITORING_CLIENT
+    if not CFG:
+        return None
+    try:
+        import oci
+        _MONITORING_CLIENT = oci.monitoring.MonitoringClient(CFG)
+        try:
+            _MONITORING_CLIENT.retry_strategy = oci.retry.NoneRetryStrategy()
+        except Exception:
+            pass
+    except Exception as e:
+        print("[RECLAIM] Monitoring 客户端创建失败:", str(e)[:120])
+        return None
+    return _MONITORING_CLIENT
+
+
+def _oci_metric_points(query_text, start_utc, end_utc, resolution=RECLAIM_RESOLUTION):
+    """走 Monitoring 的 summarizeMetricsData 取一个 MQL 查询的时间序列。
+    返回 [(timestamp, value)]；失败返回 []（不抛异常 —— 自检失败不该拖垮日报）。"""
+    mc = _monitoring_client()
+    if mc is None:
+        return []
+    try:
+        body = {
+            "namespace": "oci_computeagent",
+            "query": query_text,
+            "startTime": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "resolution": resolution,
+        }
+        resp = mc.base_client.call_api(
+            "/metrics/actions/summarizeMetricsData", "POST",
+            query_params={"compartmentId": COMPARTMENT_ID},
+            header_params={"opc-request-id": "reclaim-check",
+                           "content-type": "application/json"},
+            body=json.dumps(body), response_type="object")
+        data = resp.data
+        if isinstance(data, (str, bytes)):
+            data = json.loads(data)
+        elif hasattr(data, "text"):
+            data = json.loads(data.text)
+        pts = []
+        for item in (data or []):
+            for dp in (item.get("aggregatedDatapoints") or []):
+                pts.append((dp.get("timestamp"), dp.get("value")))
+        return pts
+    except Exception as e:
+        print("[RECLAIM] 指标查询失败:", str(e)[:160])
+        return []
+
+
+def _net_rate_kbs(points):
+    """把累计字节计数器差分成速率（KB/s）。计数器必须差分，直接取值会得到天文数字。"""
+    out = []
+    for i in range(1, len(points)):
+        t0, v0 = points[i - 1]
+        t1, v1 = points[i]
+        if not t0 or not t1:
+            continue
+        try:
+            d0 = datetime.datetime.strptime(t0, "%Y-%m-%dT%H:%M:%S.%fZ")
+            d1 = datetime.datetime.strptime(t1, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except Exception:
+            continue
+        dt = (d1 - d0).total_seconds()
+        if dt <= 0:
+            continue
+        delta = max(0.0, (v1 or 0) - (v0 or 0))
+        out.append((t1, delta / dt / 1024.0))
+    return out
+
+
+def _shape_bandwidth_kbs(compute, shape):
+    """取形状的网络带宽上限（KB/s）。取不到就返回 None —— 宁可不给网络百分比，
+    也不能拿一个拍脑袋的常数去判「是否越过 20%」。"""
+    if shape in RECLAIM_SHAPE_BW_Gbps:
+        g = RECLAIM_SHAPE_BW_Gbps[shape]
+        return None if g is None else g * 1000.0 * 1000.0 / 8.0
+    gbps = None
+    try:
+        for s in call_with_net_retry(compute.list_shapes,
+                                     compartment_id=COMPARTMENT_ID).data:
+            if s.shape == shape:
+                gbps = getattr(s, "networking_bandwidth_in_gbps", None)
+                break
+    except Exception as e:
+        print("[RECLAIM] 形状带宽查询失败:", str(e)[:120])
+    RECLAIM_SHAPE_BW_Gbps[shape] = gbps
+    if gbps is None:
+        return None
+    return gbps * 1000.0 * 1000.0 / 8.0
+
+
+def idle_reclaim_check(compute):
+    """自检 Always Free 实例的空闲回收风险，返回 Markdown 段落（无数据时返回提示行）。
+
+    判定逻辑严格对齐官方原文：三项「同时成立」才判空闲。
+    内存项只对 A1 形状适用，x86 实例不参与这一项。
+    """
+    targets = []
+    try:
+        for inst in call_with_net_retry(compute.list_instances,
+                                        compartment_id=COMPARTMENT_ID).data:
+            if inst.lifecycle_state in DEAD_STATES:
+                continue
+            # A1 是抢机目标；x86 常驻节点（free-vm）同样是 Always Free 资源，一并体检
+            targets.append(inst)
+    except Exception as e:
+        return "## 空闲回收自检\n\n- 查询实例失败：{}".format(str(e)[:120])
+
+    if not targets:
+        return "## 空闲回收自检\n\n- 当前无运行中的实例，跳过"
+
+    end_utc = datetime.datetime.now(datetime.timezone.utc)
+    start_utc = end_utc - datetime.timedelta(days=RECLAIM_WINDOW_DAYS)
+    lines = ["## 空闲回收自检（官方判据：7 天窗口内三项同时成立才回收）", ""]
+
+    for inst in targets:
+        iid = inst.id
+        shape = inst.shape or "-"
+        is_a1 = "A1" in (shape or "")
+        bw_kbs = _shape_bandwidth_kbs(compute, shape)
+
+        cpu_pts = _oci_metric_points(
+            'CpuUtilization[1m]{resourceId = "%s"}.max()' % iid,
+            start_utc, end_utc)
+        mem_pts = _oci_metric_points(
+            'MemoryUtilization[1m]{resourceId = "%s"}.max()' % iid,
+            start_utc, end_utc) if is_a1 else []
+        in_pts = _oci_metric_points(
+            'NetworksBytesIn[1m]{resourceId = "%s"}.max()' % iid,
+            start_utc, end_utc)
+        out_pts = _oci_metric_points(
+            'NetworksBytesOut[1m]{resourceId = "%s"}.max()' % iid,
+            start_utc, end_utc)
+
+        cpu_vals = [v for _, v in cpu_pts if v is not None]
+        mem_vals = [v for _, v in mem_pts if v is not None]
+        net_rates = [v for _, v in _net_rate_kbs(in_pts)] + \
+                    [v for _, v in _net_rate_kbs(out_pts)]
+
+        if not cpu_vals:
+            lines.append("- **{}**（{}）：监控数据不可用，无法判定".format(
+                inst.display_name or "-", shape))
+            continue
+
+        # ---- 数据覆盖度 ----
+        # ⚠ 实测（2026-11-02）：OCI Monitoring 只保留约 45 小时的数据，
+        #   7 天窗口永远凑不满 168 个 1h 采样点。所以这里必须如实标注覆盖度，
+        #   不能拿半截数据算出来的 p95 当成「7 天 p95」——那是自欺欺人。
+        span_h = max(1e-6, (datetime.datetime.strptime(
+            cpu_pts[-1][0], "%Y-%m-%dT%H:%M:%S.%fZ") -
+            datetime.datetime.strptime(
+            cpu_pts[0][0], "%Y-%m-%dT%H:%M:%S.%fZ")).total_seconds() / 3600.0)
+        coverage_h = min(RECLAIM_WINDOW_DAYS * 24, span_h)
+        coverage_pct = 100.0 * coverage_h / (RECLAIM_WINDOW_DAYS * 24)
+
+        cpu_p95 = _pct(cpu_vals, 95)
+        cpu_over = sum(1 for v in cpu_vals if v >= RECLAIM_THRESHOLD_PCT)
+        cpu_over_pct = 100.0 * cpu_over / len(cpu_vals)
+
+        # 网络：官方说的是「利用率」，这里用「占形状带宽上限的百分比」作近似指标
+        net_p95 = _pct(net_rates, 95)
+        net_max = max(net_rates) if net_rates else None
+        if net_p95 is not None and bw_kbs:
+            net_p95_pct = net_p95 * 100.0 / bw_kbs
+            net_max_pct = net_max * 100.0 / bw_kbs
+        else:
+            net_p95_pct = net_max_pct = None
+
+        # 逐项判定（严格按官方口径：三项同时成立才判空闲 → 任意一项越线即安全）
+        cpu_safe = cpu_p95 >= RECLAIM_THRESHOLD_PCT
+        net_safe = (net_p95_pct is not None and net_p95_pct >= RECLAIM_THRESHOLD_PCT)
+        if is_a1 and mem_vals:
+            mem_p95 = _pct(mem_vals, 95)
+            mem_safe = mem_p95 >= RECLAIM_THRESHOLD_PCT
+        else:
+            mem_p95 = None
+            mem_safe = True          # 非 A1 形状不适用内存项 → 不构成风险
+
+        risks = []
+        if not cpu_safe:
+            risks.append("CPU")
+        if not net_safe:
+            risks.append("网络")
+        if is_a1 and not mem_safe:
+            risks.append("内存")
+        safe = len(risks) == 0
+
+        # ---- 定性结论 ----
+        # p95 未过线不代表一定被回收：判据看的是「7 天窗口的 95 分位」，
+        # 只要高负载采样点占比 > 5%，p95 就会被顶到阈值之上。
+        # 所以除了 p95，再看「超线采样占比」这个更本质的量。
+        over_ratio_ok = cpu_over_pct > 5.0
+        if safe:
+            verdict = "✅ 安全（任一项越线即不会被回收）"
+        elif cpu_safe:
+            verdict = "✅ 安全（CPU 已越线）"
+        elif over_ratio_ok:
+            verdict = "🟡 CPU p95 未过线，但超线采样占比 {:.1f}% > 5%，7 天窗口仍安全".format(cpu_over_pct)
+        else:
+            verdict = "⚠️ 有风险项：{}（CPU 超线采样仅 {:.1f}%，需 >5%）".format(
+                "、".join(risks), cpu_over_pct)
+
+        lines.append("### {}（{}）— {}".format(
+            inst.display_name or "-", shape, verdict))
+        lines.append("- 采样覆盖：{:.0f}h / {}h（{:.0f}%，OCI Monitoring 实测只保留 ~45h）".format(
+            coverage_h, RECLAIM_WINDOW_DAYS * 24, coverage_pct))
+        lines.append("- CPU 95 分位：**{:.1f}%** {}（阈值 {}%）· 超线采样占比 **{:.1f}%** {}（需 >5%）".format(
+            cpu_p95, "✅" if cpu_safe else "❌",
+            int(RECLAIM_THRESHOLD_PCT), cpu_over_pct, "✅" if over_ratio_ok else "❌"))
+        if net_p95_pct is not None:
+            lines.append("- 网络 95 分位：{} KB/s ≈ 带宽的 **{:.1f}%** {}（峰值 {:.1f}%）".format(
+                "{:.0f}".format(net_p95), net_p95_pct, "✅" if net_safe else "❌",
+                net_max_pct))
+            if net_safe is False and bw_kbs:
+                lines.append("  - 注：本机物理带宽上限实测约 7.5MB/s（占标称 {:.0f}KB/s 的 {:.0f}%），"
+                             "网络项难以达线 —— 依赖 CPU 过线兜底".format(
+                                 bw_kbs, 7500.0 / bw_kbs * 100))
+        else:
+            lines.append("- 网络：数据不足，无法折算利用率（形状带宽上限未知）")
+        if is_a1:
+            if mem_p95 is not None:
+                lines.append("- 内存 95 分位：**{:.1f}%** {}（阈值 {}%，仅 A1 适用）".format(
+                    mem_p95, "✅" if mem_safe else "❌", int(RECLAIM_THRESHOLD_PCT)))
+            else:
+                lines.append("- 内存：数据不可用")
+        else:
+            lines.append("- 内存：x86 形状不适用该项（官方口径仅 A1）")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def build_instance_table(compute):
     lines = ["| 显示名 | 形状 | OCPU | 内存 | 状态 | 公网IP |",
              "| --- | --- | --- | --- | --- | --- |"]
@@ -1180,10 +1463,11 @@ def main():
                     globals()["REPORT_SENT_DATE"] = _n.strftime("%Y-%m-%d")
                     c3 = get_current_tier(arms)
                     push("甲骨文抢机日报：{}".format(TIERS[c3[0]]["label"] if c3 else "尚未抢到"),
-                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}".format(
+                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}".format(
                              now_bj(), TIERS[c3[0]]["label"] if c3 else "无（仍在抢）",
                              quota_text(arms), run_summary(), daily_summary(),
-                             build_instance_table(compute), chain_health()))
+                             build_instance_table(compute), chain_health(),
+                             idle_reclaim_check(compute)))
 
             if r < ROUNDS:
                 c = get_current_tier(arms)
@@ -1200,10 +1484,11 @@ def main():
         if REPORT_HOUR_BJ >= 0 and _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
             push("甲骨文抢机日报：{}".format(TIERS[cur2[0]]["label"] if cur2 else "尚未抢到"),
-                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}".format(
+                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}".format(
                      now_bj(), TIERS[cur2[0]]["label"] if cur2 else "无（仍在抢）",
                      quota_text(arms), run_summary(), daily_summary(),
-                     build_instance_table(compute), chain_health()))
+                     build_instance_table(compute), chain_health(),
+                     idle_reclaim_check(compute)))
 
         print("\n===== 汇总 =====")
         print(run_summary())
