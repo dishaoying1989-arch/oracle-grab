@@ -1092,6 +1092,193 @@ def _shape_bandwidth_kbs(compute, shape):
     return gbps * 1000.0 * 1000.0 / 8.0
 
 
+# ---------------- VPS 防回收保活：云端看门狗 ----------------
+# 架构（2026-11-02 晚定案）：**云端主控 + VPS 执行**，双保险。
+#
+#   VPS 侧（systemd timer）：每天 04:10 + 每 12h 各触发一次 2.5h 脉冲。
+#       优点 = 不依赖网络、不依赖云端；缺点 = 机器重启/定时器被改就哑了，且没人知道。
+#   云端侧（本模块）：每 N 轮检查一次 VPS 保活是否真的在跑，不跑就远程补一次。
+#       优点 = 自愈 + 可见；缺点 = 依赖 SSH 可达。
+#   ⇒ 两边互为冗余：本地 timer 挂了云端补，云端链路断了本地继续。
+#
+# 为什么不用 OCI Monitoring 判断「保活在不在跑」：
+#   Monitoring 只保留 ~45 小时数据，延迟太大；而 VPS 上有**心跳文件**
+#   （/var/lock/oci-keepalive.heartbeat），SSH 读它毫秒级返回，是最准的状态源。
+#   Monitoring 只用来在日报里展示「回收风险三项实测」（见 idle_reclaim_check）。
+#
+# ★ 关键约束：产生负载的进程**必须跑在 free-vm 上**。
+#   在 GitHub Actions runner 上压 CPU 对 free-vm 的 CpuUtilization 毫无帮助 ——
+#   OCI 判的是 free-vm 自己的指标。云端只负责「判断 + 触发」。
+#
+# 触发方式：SSH（云端 Actions → VPS）。已确认：
+#   - Default Security List 的 22 端口是 0.0.0.0/0 放行 → runner 可直连，无需改安全组；
+#   - Run Command API 不可用（404，该服务在新版 SDK/本租户下不可用）→ SSH 是唯一通道。
+VPS_SSH_HOST = os.environ.get("VPS_SSH_HOST", "").strip()
+VPS_SSH_USER = os.environ.get("VPS_SSH_USER", "ubuntu").strip()
+VPS_SSH_KEY = os.environ.get("VPS_SSH_KEY", "").strip()
+VPS_KEEPALIVE_SCRIPT = "/usr/local/bin/oci-keepalive.sh"
+VPS_HEARTBEAT = "/var/lock/oci-keepalive.heartbeat"
+VPS_KEEPALIVE_DURATION = 9000          # 补触发时长（秒），与本地 timer 一致
+KEEPALIVE_CHECK_EVERY_ROUNDS = 30      # 每 N 轮检查一次（轮间隔 90~600s → 约 45~180 分钟）
+KEEPALIVE_STATE_FILE = os.path.join(STATE_DIR, "vps_keepalive.json")
+
+
+def _ssh_run(cmd, timeout=60):
+    """在 VPS 上跑一条命令，返回 (rc, stdout+stderr)。没有配置 SSH 就返回 (None, "")。"""
+    if not (VPS_SSH_HOST and VPS_SSH_KEY):
+        return None, ""
+    try:
+        import subprocess
+        keyfile = os.path.join(tempfile.gettempdir(), "wb_vps_key")
+        with open(keyfile, "w", encoding="utf-8") as f:
+            f.write(VPS_SSH_KEY)
+        try:
+            os.chmod(keyfile, 0o600)
+        except Exception:
+            pass
+        argv = [
+            "ssh", "-i", keyfile,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
+            "{}@{}".format(VPS_SSH_USER, VPS_SSH_HOST), cmd,
+        ]
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "ssh timeout"
+    except Exception as e:
+        return 1, "ssh error: {}".format(str(e)[:150])
+    finally:
+        try:
+            os.remove(keyfile)
+        except Exception:
+            pass
+
+
+def vps_keepalive_check(compute=None):
+    """云端看门狗：检查 VPS 保活是否在跑，不跑就补一次脉冲。
+
+    判定依据是 VPS 上的心跳文件（比 Monitoring 快 45 小时）：
+      - 文件不存在        → 保活从没跑过 → 立刻补
+      - status=RUNNING    → 正在跑（且 until 未过期）→ 不动
+      - status=DONE 且距上次结束很久 → 该补了
+    返回一行人类可读的状态描述（给日志用）。
+    """
+    if not (VPS_SSH_HOST and VPS_SSH_KEY):
+        return "保活看门狗：未配置 VPS_SSH_HOST/VPS_SSH_KEY，跳过"
+
+    rc, out = _ssh_run("cat {} 2>/dev/null || echo MISSING".format(VPS_HEARTBEAT), timeout=30)
+    if rc is None:
+        return "保活看门狗：未配置 SSH，跳过"
+    if rc != 0:
+        return "保活看门狗：SSH 不可达（rc={}）{}".format(rc, out.strip()[:120])
+
+    line = (out or "").strip().splitlines()[0] if (out or "").strip() else "MISSING"
+    if not line or line == "MISSING":
+        # 心跳都没有 → 保活从没成功跑过，立刻补
+        return vps_keepalive_trigger("心跳文件缺失（保活从未成功运行）")
+
+    try:
+        status, started, until, cpu, net = line.split("|")
+        started = int(started)
+        until = int(until)
+    except Exception:
+        return vps_keepalive_trigger("心跳格式异常：{}".format(line[:80]))
+
+    now = int(time.time())
+    if status == "RUNNING" and until > now:
+        left = until - now
+        return "保活看门狗：✅ 脉冲运行中（剩余 {} 分钟，CPU目标{}%）".format(left // 60, cpu)
+
+    # RUNNING 但已过期，或 DONE —— 说明当前没有脉冲在跑
+    idle_min = (now - until) // 60
+    if idle_min > 60:
+        return vps_keepalive_trigger("已 {} 分钟无脉冲（心跳 status={}）".format(idle_min, status))
+    return "保活看门狗：脉冲刚结束（{} 分钟前），暂不补触发".format(idle_min)
+
+
+def vps_keepalive_trigger(reason):
+    """远程触发一次保活脉冲（--background，SSH 立即返回）。"""
+    cmd = "sudo {} {} 70 1250 4 --background".format(
+        VPS_KEEPALIVE_SCRIPT, VPS_KEEPALIVE_DURATION)
+    rc, out = _ssh_run(cmd, timeout=90)
+    ok = (rc == 0)
+    print("[KEEPALIVE] 触发保活（{}）rc={} {}".format(reason, rc, (out or "").strip()[-160:]))
+    # 记一笔到 state，方便日报/排障时看
+    try:
+        st = {}
+        if os.path.exists(KEEPALIVE_STATE_FILE):
+            with open(KEEPALIVE_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        st["last_trigger"] = now_bj()
+        st["last_reason"] = reason
+        st["last_rc"] = rc
+        st["last_ok"] = ok
+        st["trigger_count"] = int(st.get("trigger_count", 0)) + 1
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(KEEPALIVE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception as e:
+        print("[KEEPALIVE] 状态写入失败:", str(e)[:100])
+    if not ok:
+        return "保活看门狗：❌ 触发失败 rc={} {}".format(rc, (out or "").strip()[:120])
+    return "保活看门狗：🔧 已补触发脉冲（{}）".format(reason)
+
+
+def vps_keepalive_report():
+    """日报里的「VPS 保活状态」段落：心跳 + 云端补触发记录。
+
+    不做任何写操作（纯只读），日报不该有副作用。
+    """
+    lines = ["## VPS 防回收保活（云端主控 + VPS 执行）"]
+    if not (VPS_SSH_HOST and VPS_SSH_KEY):
+        lines.append("- ⚠ 未配置 VPS_SSH_HOST / VPS_SSH_KEY → 云端看门狗未启用")
+        lines.append("- 保活仍由 VPS 本地 systemd timer 独立执行（每天 04:10 + 每 12h）")
+        return "\n".join(lines)
+    try:
+        rc, out = _ssh_run("cat {} 2>/dev/null || echo MISSING".format(VPS_HEARTBEAT), timeout=30)
+        if rc != 0:
+            lines.append("- ❌ SSH 不可达（rc={}）：{}".format(rc, (out or "").strip()[:120]))
+        else:
+            line = (out or "").strip().splitlines()[0] if (out or "").strip() else "MISSING"
+            if line == "MISSING" or not line:
+                lines.append("- ❌ 心跳文件缺失 → 保活从未成功运行，云端下次检查会补触发")
+            else:
+                try:
+                    status, started, until, cpu, net = line.split("|")
+                    started, until = int(started), int(until)
+                    now = int(time.time())
+                    bj = datetime.datetime.fromtimestamp(started, TZ_BJ).strftime("%m-%d %H:%M")
+                    if status == "RUNNING" and until > now:
+                        lines.append("- ✅ 脉冲运行中：{} 启动，剩余 {} 分钟（CPU目标{}% / 网络{}KB/s）".format(
+                            bj, (until - now) // 60, cpu, net))
+                    else:
+                        lines.append("- ℹ️ 最近一次脉冲：{} 结束（status={}，{} 分钟前）".format(
+                            bj, status, max(0, (now - until)) // 60))
+                except Exception:
+                    lines.append("- ⚠ 心跳格式异常：{}".format(line[:100]))
+    except Exception as e:
+        lines.append("- 查询异常：{}".format(str(e)[:120]))
+
+    # 云端补触发记录（state 文件，跨棒保留）
+    try:
+        if os.path.exists(KEEPALIVE_STATE_FILE):
+            with open(KEEPALIVE_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            lines.append("- 云端补触发：累计 {} 次，最近 {}（{}，rc={}）".format(
+                st.get("trigger_count", 0), st.get("last_trigger", "-"),
+                st.get("last_reason", "-"), st.get("last_rc", "-")))
+    except Exception:
+        pass
+    lines.append("- 架构：本地 timer 每天 2 次 + 云端每 {} 轮自检补触发，互为冗余".format(
+        KEEPALIVE_CHECK_EVERY_ROUNDS))
+    return "\n".join(lines)
+
+
 def idle_reclaim_check(compute):
     """自检 Always Free 实例的空闲回收风险，返回 Markdown 段落（无数据时返回提示行）。
 
@@ -1442,6 +1629,14 @@ def main():
                 adapt_gap(bool(ROUND_HIT_RATE_LIMIT) or bool(fail and fail.get("type") == "rate_limit"),
                           retry_after=LAST_RETRY_AFTER)
 
+            # VPS 保活看门狗：每 N 轮检查一次，不跑就远程补一次（云端主控 + VPS 执行）
+            if not DRY_RUN and (r % KEEPALIVE_CHECK_EVERY_ROUNDS == 0):
+                try:
+                    _ka = vps_keepalive_check(compute)
+                    print("[KEEPALIVE]", _ka)
+                except Exception as e:
+                    print("[KEEPALIVE] 看门狗异常:", str(e)[:150])
+
             if event and not DRY_RUN:
                 push(event[0], event[1] + "\n\n---\n" + run_summary() + "\n\n" + daily_summary())
                 events_sent = True
@@ -1463,11 +1658,12 @@ def main():
                     globals()["REPORT_SENT_DATE"] = _n.strftime("%Y-%m-%d")
                     c3 = get_current_tier(arms)
                     push("甲骨文抢机日报：{}".format(TIERS[c3[0]]["label"] if c3 else "尚未抢到"),
-                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}".format(
+                         "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}\n\n{}".format(
                              now_bj(), TIERS[c3[0]]["label"] if c3 else "无（仍在抢）",
                              quota_text(arms), run_summary(), daily_summary(),
                              build_instance_table(compute), chain_health(),
-                             idle_reclaim_check(compute)))
+                             idle_reclaim_check(compute),
+                             vps_keepalive_report()))
 
             if r < ROUNDS:
                 c = get_current_tier(arms)
@@ -1484,11 +1680,12 @@ def main():
         if REPORT_HOUR_BJ >= 0 and _n2.hour == REPORT_HOUR_BJ and not DRY_RUN and REPORT_SENT_DATE != _n2.strftime("%Y-%m-%d"):
             cur2 = get_current_tier(arms)
             push("甲骨文抢机日报：{}".format(TIERS[cur2[0]]["label"] if cur2 else "尚未抢到"),
-                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}".format(
+                 "## 日报（北京 {}）\n\n- 档位：{}\n- 额度：{}\n- {}\n- {}\n\n{}\n\n{}\n\n{}\n\n{}".format(
                      now_bj(), TIERS[cur2[0]]["label"] if cur2 else "无（仍在抢）",
                      quota_text(arms), run_summary(), daily_summary(),
                      build_instance_table(compute), chain_health(),
-                     idle_reclaim_check(compute)))
+                     idle_reclaim_check(compute),
+                     vps_keepalive_report()))
 
         print("\n===== 汇总 =====")
         print(run_summary())
