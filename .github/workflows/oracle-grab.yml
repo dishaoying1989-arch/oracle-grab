@@ -92,6 +92,12 @@ jobs:
           GRAB_STATE_DIR: .grab_state
           # 供脚本内 chain_health() 只读查本仓库 Actions 运行记录（体检信息并入 02:00 日报）
           GH_PAT: ${{ secrets.GH_PAT }}
+          # VPS 防回收保活看门狗：云端主控，每 N 轮 SSH 检查 free-vm 保活是否在跑，不跑就远程补触发。
+          # ⚠ 产生负载的进程仍跑在 free-vm 上 —— OCI 判的是 free-vm 自己的指标，
+          #   在 runner 上压 CPU 对它毫无帮助。云端只负责「判断 + 触发」。
+          VPS_SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
+          VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
           echo "$(date +%s)" > /tmp/grab_start_ts
           python scripts/oracle_grab_actions.py \
