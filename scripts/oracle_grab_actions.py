@@ -78,8 +78,14 @@ SUBNET_ID = os.environ.get("OCI_SUBNET_ID", "").strip() or \
 ARM_IMAGE_ID = "ocid1.image.oc1.ap-osaka-1.aaaaaaaafjymvqo2bqj5uur45dfvhch6sp72yedb7xfaenkbvufx5zisnmya"  # 回退值
 BOOT_VOLUME_GB = 50
 
-FREE_TOTAL_OCPUS = 4
-FREE_TOTAL_MEM_GB = 24
+FREE_TOTAL_OCPUS = 2
+FREE_TOTAL_MEM_GB = 12
+# 2026-11-02：不再硬编码 4C/24G。Oracle 2026-06-15 把免费档砍到 2C/12G，
+# 本账号 Limits API 实测 standard-a1-core-count=2 / standard-a1-memory-count=12，
+# 配额 available 也是满的（2 核 / 12G，说明额度没被占、不是配额问题）。
+# 下面这两个是启动时的实测缓存，由 refresh_free_quota() 填充，避免每次都打 Limits API。
+_FREE_QUOTA_CACHE = {}
+FREE_QUOTA_TTL = 3600          # 实测配额缓存有效期（秒）
 
 TIERS = [
     {"ocpus": 1, "memory_gb": 1,  "label": "1核1G"},
@@ -88,6 +94,26 @@ TIERS = [
     {"ocpus": 4, "memory_gb": 24, "label": "4核24G"},
 ]
 ARM_SHAPE = "VM.Standard.A1.Flex"
+
+# ★ 2026-11-02 新增：多档位轮换探测（PROBE_TIERS）
+#
+# 为什么需要：原实现每轮只试 TIERS[0]（1核1G）一档，命中面最窄。
+# 实测全历史（298 个 run / 2757 次 create）成功率 0 —— 但这不能证明"档位没用"，
+# 因为始终只试了 1核1G 这一个组合，从没试过 1核6G / 2核12G。
+# A1.Flex 是 flexible shape，同一个 AD 下的可用容量是按 (ocpus, memory) 组合
+# 分桶的（官方 shapeConfigOptions 明确列出各组合），不同组合命中不同分桶。
+#
+# 为什么顺序是 1核1G → 1核6G → 2核12G：
+#   1核1G 占的物理资源最少 → 最容易排上（社区通用经验：小规格库存相对充裕）；
+#   2核12G 才是这个账号真正想要的档位（实测 A1 限额就是 2核12G），
+#   但它要的整块容量最大，最难排上。
+# 所以每轮按顺序轮换尝试，用 PROBE_TIER_IDX 记录进度，跨棒保留。
+#
+# 注意：这不增加 API 调用量 —— 仍然是每轮一次 create，只是换 shape_config，
+# 所以不会加剧 429；命中哪档就直接建哪档，之后照旧走原地升配阶梯。
+PROBE_TIERS = [0, 1, 2]             # 参与轮换的 TIERS 索引（不含 4核24G：实测限额只有 2核12G）
+PROBE_TIER_IDX = 0                  # 当前轮到第几档
+PROBE_TIER_FILE = os.path.join(STATE_DIR, "probe_tier.json")
 
 # 多 AD 轮换（开源最佳实践：大阪/东京等多数区域有 3 个 AD，容量可能只出现在某一个）。
 # 本账号实测只有 1 个 AD（AD-1），所以是 no-op；但代码保留轮换能力，换区域/换账号即自动生效。
@@ -110,6 +136,19 @@ CAP_REPROBE_HOURS = 6
 _LIMITS_CLIENT = None                 # Limits 客户端（惰性创建，仅用于只读配额探测）
 CFG = None                            # OCI 配置（init_clients 里落库，供 Limits 探测复用）
 
+# 2026-11-02：封顶档位的**默认值**原来一直是 len(TIERS)-1 = 4核24G，
+# 但这个账号的实测限额是 2核/12G —— 4核24G 永远创建不出来（只会白撞 limit）。
+# 现在默认封顶到「实测额度能支撑的最高档」，并在拿到实测额度后动态收窄。
+def _default_cap_tier():
+    """按实测额度（2核12G）推导默认封顶档位：能整档装下就允许，否则退一档。"""
+    best = 0
+    for i, t in enumerate(TIERS):
+        if t["ocpus"] <= FREE_TOTAL_OCPUS and t["memory_gb"] <= FREE_TOTAL_MEM_GB:
+            best = i
+    return best
+
+CAPPED_TIER = _default_cap_tier()
+
 ROUNDS = 3                       # 单次 run 内尝试轮数（workflow 可通过输入覆盖）
 ROUND_GAP_CREATE = 45            # 无实例时轮间隔**基准值**（自检/回退用；运行时走下面的自适应间隔）
 ROUND_GAP_RESIZE = 150           # 有实例时轮间隔
@@ -123,12 +162,24 @@ ROUND_GAP_IDLE = 420             # 顶配巡检间隔
 #       - 低于 GAP_LO -> 乘性缩短间隔（小步提速，去试探真实上限）
 #       - 介于两者之间 -> 保持不动（避免在阈值附近来回抖）
 # 自适应值会写进 .grab_state/adaptive_gap.json 跨棒保留，不用每棒从头试探。
+#
+# ★ 2026-11-02 修复（两个真 bug，均已实测确认）：
+#   bug1: 轮末返回给 adapt_gap 的 fail["type"] 永远是 "capacity"（429 在 call_with_rate_limit
+#         内部就被重试消化掉了），所以「退让」分支一次都没触发过 —— 实测 run #296 里
+#         RATE-LIMIT 出现 45 次，[GAP] 退让/提速行 0 次，间隔全程钉死在 90s 下限。
+#         现在改用轮级标志 ROUND_HIT_RATE_LIMIT 传递真实 429 命中。
+#   bug2: 上面注释描述的是「429 命中率 EWMA + 阈值带」，但原实现其实是「连续 N 轮没撞就提速」
+#         的计数器 —— 两者语义完全不同，注释与实现不符。计数器在 429 偶发时会把间隔一路
+#         拉到下限（90s），等于没有自适应。现在按注释实现真正的 EWMA + 阈值带。
 GAP_INIT_CREATE = 180            # 自适应起始间隔（秒）
 GAP_MIN_CREATE = 90              # 下限：再顺畅也不快过 90s，给账号留安全边际
 GAP_MAX_CREATE = 600             # 上限：限流再重也最多退到 10 分钟一轮
 GAP_MULT_UP = 1.35               # 退让倍数（撞 429 就拉大间隔，反应要快）
 GAP_MULT_DOWN = 0.90             # 提速倍数（缩短间隔，小步试探）
 GAP_UP_COOLDOWN = 5              # 连续多少轮"无 429"才提速一次（防抖、防冒进）
+GAP_EWMA_ALPHA = 0.30            # EWMA 平滑系数（0.3 ≈ 最近 3~4 轮的影响）
+GAP_HI = 0.35                    # 429 命中率 > 35% -> 退让
+GAP_LO = 0.10                    # 429 命中率 < 10% -> 提速（带内不动，防抖）
 
 # 接力模式：单棒最长运行秒数（0=不限）。GitHub 单个 job 上限 6 小时，
 # workflow 传 19500（约 5.4 小时）跑满后优雅退场，再由 workflow 触发下一棒，
@@ -230,7 +281,7 @@ LAST_RETRY_AFTER = None
 
 
 def rate_limit_wait(err, attempt):
-    # Actions 单 run 有 12 分钟预算，退避上限收紧到 120s，总重试不超过 ~6 分钟
+    # Actions 单 run 有 6 小时预算；退避上限收紧到 120s，单轮最多重试 ~6 分钟
     global LAST_RETRY_AFTER
     wait = get_retry_after(err)
     LAST_RETRY_AFTER = wait
@@ -243,13 +294,25 @@ def rate_limit_wait(err, attempt):
     return wait
 
 
+# 每一轮内是否撞过 429。
+# 【2026-11-02 修复的真实 bug】原来 429 只体现在 RUN["rate_limit"] 计数上，
+# 而 adapt_gap() 的入参是 fail["type"] == "rate_limit" —— 但 call_with_rate_limit()
+# 在轮内就把 429 重试消化掉了，轮末返回给 do_round 的 fail 已经是 "capacity"，
+# 于是 adapt_gap 永远收到 hit_rate_limit=False，AIMD 的「退让」分支一次都没触发过
+# （2026-11-02 实测 run #296：RATE-LIMIT 出现 45 次，[GAP] 退让/提速行 0 次，
+#   轮间隔全程钉死在 90s 下限）。现在用轮级标志把真实 429 命中率传给 AIMD。
+ROUND_HIT_RATE_LIMIT = False
+
+
 def call_with_rate_limit(func, *args, max_attempts=2, **kwargs):
+    global ROUND_HIT_RATE_LIMIT
     attempt = 0
     while True:
         try:
             return func(*args, **kwargs)
         except Exception as e:
             if is_rate_limited(e) and attempt < max_attempts:
+                ROUND_HIT_RATE_LIMIT = True
                 rate_limit_wait(e, attempt)
                 attempt += 1
                 continue
@@ -309,13 +372,23 @@ def classify_error(e):
 # ---------------- 自适应轮间隔 ----------------
 GAP_CREATE = GAP_INIT_CREATE
 _gap_clean = 0
+_gap_ewma = None            # 429 命中率的 EWMA（None = 本棒还没样本）
 GAP_FILE = os.path.join(STATE_DIR, "adaptive_gap.json")
 
 
 def _load_gap():
     try:
         with open(GAP_FILE, "r", encoding="utf-8") as f:
-            v = float(json.load(f).get("gap_create", GAP_INIT_CREATE))
+            d = json.load(f)
+        v = float(d.get("gap_create", GAP_INIT_CREATE))
+        # 2026-11-02：把 EWMA 也跨棒恢复，避免每棒开头重新"学习"限流水位
+        ew = d.get("ewma")
+        global _gap_ewma
+        if ew is not None:
+            try:
+                _gap_ewma = min(max(float(ew), 0.0), 1.0)
+            except Exception:
+                _gap_ewma = None
         return min(max(v, GAP_MIN_CREATE), GAP_MAX_CREATE)
     except Exception:
         return GAP_INIT_CREATE
@@ -325,8 +398,27 @@ def _save_gap(v):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(GAP_FILE, "w", encoding="utf-8") as f:
-            json.dump({"gap_create": round(float(v), 1), "updated": now_bj()},
+            json.dump({"gap_create": round(float(v), 1), "updated": now_bj(),
+                       "ewma": (round(float(_gap_ewma), 4) if _gap_ewma is not None else None)},
                       f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_probe_tier():
+    try:
+        with open(PROBE_TIER_FILE, "r", encoding="utf-8") as f:
+            v = int(json.load(f).get("probe_tier_idx", 0))
+        return max(0, min(v, len(PROBE_TIERS) - 1))
+    except Exception:
+        return 0
+
+
+def _save_probe_tier(v):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PROBE_TIER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"probe_tier_idx": int(v), "updated": now_bj()}, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -364,9 +456,81 @@ def _save_cap(v):
         pass
 
 
+def refresh_free_quota():
+    """用 Limits API 实测账户 A1 免费额度上限（只读，不消耗 create 限流）。
+    2026-11-02 新增：以前 quota_text() 硬编码 4C/24G，但真实值是 2C/12G ——
+    日报里一直显示错的额度，会误导"是不是额度用完了"的判断。"""
+    global FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB, _LIMITS_CLIENT
+    try:
+        import oci
+        if _LIMITS_CLIENT is None:
+            if not CFG:
+                return None
+            _LIMITS_CLIENT = oci.limits.LimitsClient(CFG)
+            try:
+                _LIMITS_CLIENT.retry_strategy = oci.retry.NoneRetryStrategy()
+            except Exception:
+                pass
+        ad = current_ad()
+        # ★ 重要口径区别（2026-11-02 实测确认）：
+        #   get_resource_availability().available = **剩余可分配量**（会随实例占用而变）
+        #   list_limit_values(...).value        = **限额上限**（恒定 2 / 12）
+        # 上限要用 list_limit_values 取；available 只用来判断"额度是不是真的被占满了"。
+        try:
+            vals = call_with_net_retry(
+                _LIMITS_CLIENT.list_limit_values,
+                compartment_id=COMPARTMENT_ID, service_name="compute",
+                name="standard-a1-core-count").data
+            if vals:
+                FREE_TOTAL_OCPUS = int(vals[0].value)
+        except Exception:
+            pass
+        try:
+            vals = call_with_net_retry(
+                _LIMITS_CLIENT.list_limit_values,
+                compartment_id=COMPARTMENT_ID, service_name="compute",
+                name="standard-a1-memory-count").data
+            if vals:
+                FREE_TOTAL_MEM_GB = int(vals[0].value)
+        except Exception:
+            pass
+        # 顺带看剩余量（额度被占满时 available 会小于上限）
+        avail_c = None
+        try:
+            avail_c = call_with_net_retry(
+                _LIMITS_CLIENT.get_resource_availability,
+                service_name="compute", limit_name="standard-a1-core-count",
+                compartment_id=COMPARTMENT_ID, availability_domain=ad).data.available
+        except Exception:
+            pass
+        _FREE_QUOTA_CACHE.clear()
+        _FREE_QUOTA_CACHE.update({"cores": FREE_TOTAL_OCPUS, "mem": FREE_TOTAL_MEM_GB,
+                                   "ts": time.time()})
+        print("[QUOTA] 实测 A1 免费额度上限：{}核/{}G（当前剩余 {} 核）".format(
+            FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB,
+            avail_c if avail_c is not None else "?"))
+        # 实测额度既然已知，就把封顶档位收窄到「额度能整档装下的最高档」——
+        # 4核24G 在 2核/12G 的账号上永远创建不出来，试它只是白撞 limit。
+        want = _default_cap_tier()
+        if CAPPED_TIER > want:
+            _save_cap(want)
+            print("[QUOTA] 按实测额度把封顶档位从 {} 收窄到 {}".format(
+                TIERS[CAPPED_TIER]["label"] if CAPPED_TIER >= 0 else "无",
+                TIERS[want]["label"]))
+        return (FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB)
+    except Exception as e:
+        print("[QUOTA] 额度实测失败，沿用默认值 {}核/{}G: {}".format(
+            FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB, str(e)[:100]))
+        return None
+
+
 def probe_a1_availability():
-    """只读查询账户 A1 免费配额剩余量（Limits API：不创建实例、不消耗 create 限流额度）。
-    返回 (可用核数, 可用内存GB)；探测失败返回 None。"""
+    """只读查询账户 A1 免费配额**剩余量**（Limits API：不创建实例、不消耗 create 限流额度）。
+    返回 (剩余可用核数, 剩余可用内存GB)；探测失败返回 None。
+
+    口径说明：这里用 get_resource_availability().available（剩余可分配量）是对的 ——
+    判断"额度是不是真的被占满了"要看剩余量，而不是限额上限。
+    （限额上限由 refresh_free_quota 用 list_limit_values 取，两者不是一回事。）"""
     global _LIMITS_CLIENT
     try:
         import oci
@@ -420,10 +584,23 @@ def maybe_unbrick_cap():
 
 
 def adapt_gap(hit_rate_limit, retry_after=None):
-    """撞 429 立刻拉大间隔；连续顺畅 GAP_UP_COOLDOWN 轮再小步提速（AIMD）。
-    retry_after：OCI 在 429 响应头给的退避秒数 —— 它比我们猜的准，优先采纳（封顶在区间内）。"""
-    global GAP_CREATE, _gap_clean
-    if hit_rate_limit:
+    """按 429 命中率的 EWMA 自适应轮间隔（真正的 AIMD，带阈值带防抖）。
+    retry_after：OCI 在 429 响应头给的退避秒数 —— 它比我们猜的准，优先采纳（封顶在区间内）。
+
+    【2026-11-02 重写】原实现是「连续 N 轮没撞 429 就提速」的计数器，与注释描述的
+    EWMA 阈值带完全不符，且轮末拿不到真实 429 信号（见 GAP 段 bug1/bug2 注释）。
+    现在每轮更新 EWMA：命中率 > GAP_HI 退让、< GAP_LO 提速、带内保持不动。
+    """
+    global GAP_CREATE, _gap_clean, _gap_ewma
+    # 1) 更新 429 命中率 EWMA（这一轮撞了 = 1，没撞 = 0）
+    sample = 1.0 if hit_rate_limit else 0.0
+    if _gap_ewma is None:
+        _gap_ewma = sample
+    else:
+        _gap_ewma = (1 - GAP_EWMA_ALPHA) * _gap_ewma + GAP_EWMA_ALPHA * sample
+
+    # 2) 按 EWMA 落在哪条区间决定动作
+    if _gap_ewma > GAP_HI:
         _gap_clean = 0
         if retry_after and retry_after > 0:
             new = min(max(retry_after, GAP_MIN_CREATE), GAP_MAX_CREATE)
@@ -431,15 +608,21 @@ def adapt_gap(hit_rate_limit, retry_after=None):
         else:
             new = min(GAP_CREATE * GAP_MULT_UP, GAP_MAX_CREATE)
             act = "退让"
-    else:
+    elif _gap_ewma < GAP_LO:
         _gap_clean += 1
         if _gap_clean < GAP_UP_COOLDOWN:
             return
         _gap_clean = 0
         new = max(GAP_CREATE * GAP_MULT_DOWN, GAP_MIN_CREATE)
         act = "提速"
+    else:
+        # 带内：保持当前间隔，但清掉提速冷却计数（一旦出了带才有资格提速）
+        _gap_clean = 0
+        return
+
     if abs(new - GAP_CREATE) >= 1:
-        print("[GAP] {} → 轮间隔 {}s -> {}s".format(act, int(GAP_CREATE), int(new)))
+        print("[GAP] {}（429率 {:.0%}） → 轮间隔 {}s -> {}s".format(
+            act, _gap_ewma, int(GAP_CREATE), int(new)))
         GAP_CREATE = new
         _save_gap(new)
 
@@ -644,9 +827,18 @@ def get_current_tier(arms):
 
 
 def quota_text(arms):
+    # 2026-11-02：免费额度不再硬编码 4C/24G（Oracle 2026-06-15 已砍到 2C/12G，
+    # 且本账号 Limits API 实测就是 standard-a1-core-count=2 / memory-count=12）。
+    # 改为优先用实测值；探测不到时回落到实测确认的 2C/12G。
+    total_c, total_g = FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB
+    if _FREE_QUOTA_CACHE and _FREE_QUOTA_CACHE.get("ts"):
+        age = time.time() - _FREE_QUOTA_CACHE["ts"]
+        if age < FREE_QUOTA_TTL:
+            total_c = _FREE_QUOTA_CACHE.get("cores", total_c)
+            total_g = _FREE_QUOTA_CACHE.get("mem", total_g)
     return "{}C/{}G（免费额度 {}C/{}G）".format(
         sum(a["ocpus"] for a in arms), sum(a["memory_gb"] for a in arms),
-        FREE_TOTAL_OCPUS, FREE_TOTAL_MEM_GB)
+        total_c, total_g)
 
 
 def wait_for_state(compute, instance_id, target, timeout=STATE_WAIT_TIMEOUT):
@@ -789,16 +981,27 @@ def run_summary():
 # ---------------- 单轮 ----------------
 def do_round(compute, arms):
     import oci
+    global PROBE_TIER_IDX
     cur = get_current_tier(arms)
     idx = cur[0] if cur else -1
 
-    # A. 无实例 -> 抢保底
+    # A. 无实例 -> 抢保底（2026-11-02：档位轮换探测，不再固定只试 1核1G）
     if cur is None:
         if CAPPED_TIER < 0:
             print("[ROUND] 账户免A1额度为0（已封顶），跳过创建，仅巡检")
             return arms, None, None
-        t = TIERS[0]
-        print("[ROUND] 无 ARM，抢保底 {}（AD={}）".format(t["label"], current_ad()))
+        # 轮换档位：1核1G → 1核6G → 2核12G（见 PROBE_TIERS 注释）。
+        # 只挑封顶额度以内的档位；超出封顶的档位跳过（额度到不了，试了只是白撞 limit）。
+        usable = [i for i in PROBE_TIERS if i <= CAPPED_TIER]
+        if not usable:
+            print("[ROUND] 所有档位都超出封顶额度，仅巡检")
+            return arms, None, None
+        ti = usable[PROBE_TIER_IDX % len(usable)]
+        PROBE_TIER_IDX = (PROBE_TIER_IDX + 1) % len(usable)
+        _save_probe_tier(PROBE_TIER_IDX)
+        t = TIERS[ti]
+        print("[ROUND] 无 ARM，探测档位 {}（AD={}，轮换 {}/{}）".format(
+            t["label"], current_ad(), usable.index(ti) + 1, len(usable)))
         inst_id, name, fail = action_create(compute, t, dry_run=DRY_RUN)
         if inst_id is None:
             ftype = fail.get("type", "error") if fail else "error"
@@ -900,6 +1103,8 @@ def main():
     global GAP_CREATE
     GAP_CREATE = _load_gap()
     _load_cap()                              # 读取账户免费 A1 档位封顶（跨日保留）
+    global PROBE_TIER_IDX
+    PROBE_TIER_IDX = _load_probe_tier()      # 读取档位轮换游标（跨棒保留）
     print("=" * 60)
     print("甲骨文抢机 Actions 版启动 | 北京时间 {} | rounds={} dry={} status={}".format(
         now_bj(), ROUNDS, DRY_RUN, STATUS_ONLY))
@@ -907,6 +1112,8 @@ def main():
         int(GAP_CREATE), GAP_MIN_CREATE, GAP_MAX_CREATE))
     cap_label = "无（账户免A1额度为0）" if CAPPED_TIER < 0 else TIERS[CAPPED_TIER]["label"]
     print("[CAP] 账户 A1 免费档封顶：{}（撞 limit 自动下调，跨日保留）".format(cap_label))
+    print("[TIER] 探测档位轮换：{}（起始序号 {}）".format(
+        " → ".join(TIERS[i]["label"] for i in PROBE_TIERS), PROBE_TIER_IDX))
     print("=" * 60)
 
     import oci
@@ -915,6 +1122,7 @@ def main():
         if maybe_unbrick_cap():
             print("[CAP] 复核后封顶：{}".format(
                 "无（账户免A1额度为0）" if CAPPED_TIER < 0 else TIERS[CAPPED_TIER]["label"]))
+        refresh_free_quota()              # 实测免费额度（原来硬编码 4C/24G 是错的）
         arms = list_arm_instances(compute)
         cur = get_current_tier(arms)
         print("[状态] ARM {} 台 | 档位 {} | 额度 {}".format(
@@ -932,6 +1140,9 @@ def main():
         for r in range(1, ROUNDS + 1):
             RUN["rounds"] = r
             print("\n----- 轮 {}/{} -----".format(r, ROUNDS))
+            # 每轮重置 429 命中标志（由 call_with_rate_limit 在轮内设置）
+            global ROUND_HIT_RATE_LIMIT
+            ROUND_HIT_RATE_LIMIT = False
             try:
                 arms, event, fail = do_round(compute, arms)
             except Exception as e:
@@ -943,9 +1154,9 @@ def main():
                     pass
                 event, fail = None, None
 
-            # 自适应节奏：本轮撞到 429 就拉大间隔（优先遵从 OCI 的 Retry-After），连续顺畅再小步提速
+            # 自适应节奏：用轮级标志传真实 429 命中（2026-11-02 修复，见 GAP 段 bug1）
             if not DRY_RUN:
-                adapt_gap(bool(fail and fail.get("type") == "rate_limit"),
+                adapt_gap(bool(ROUND_HIT_RATE_LIMIT) or bool(fail and fail.get("type") == "rate_limit"),
                           retry_after=LAST_RETRY_AFTER)
 
             if event and not DRY_RUN:
